@@ -90,7 +90,8 @@ Its source was verified against both frozen archives. The signed appcast and
 archive smoke test passes, and a tampered archive is rejected. Apple notarization
 has accepted both exported apps and both signed disk images. The existing
 `DuoDisplay` credential profile works through the default data-protection Keychain.
-Final release-feed generation is awaiting local authorization of the Sparkle key.
+Both release feeds are now generated, signed and verified. No Keychain prompt
+remains; the release is ready for an unpublished GitHub draft.
 Public feed/download verification waits until an approved release is published.
 No public Mac release has been made. Live USB/Wi-Fi streaming was not re-tested
 as part of release setup.
