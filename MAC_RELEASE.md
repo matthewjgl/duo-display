@@ -31,7 +31,9 @@ python3 scripts/release/mac.py prepare --version 1.0.0 --build 1
 
 The command copies only app sources into `build/releases/VERSION-BUILD/source`,
 records SHA-256 hashes, generates the Xcode project in that copy, archives both
-architectures, verifies Developer ID signatures, notarizes and staples each app
+architectures, exports for Developer ID distribution, verifies the app and every
+nested Sparkle helper for both architectures (certificate, runtime and timestamp),
+then notarizes and staples each app
 and DMG, and generates and verifies signed appcasts. It publishes nothing.
 It never rebuilds or re-signs the active development apps.
 
@@ -97,3 +99,16 @@ history and upstream remote. Copy only reviewed application/build source into th
 publishing checkout before an explicit source push; never copy websites, local
 notes, credentials or build output. The draft command verifies that every frozen
 application source file matches the exact public commit before uploading assets.
+
+## Distribution export correction
+
+The initial sender archive failed Apple notarization because its nested Sparkle
+helpers retained ad hoc signatures. Xcode’s Developer ID distribution export
+corrects these signatures. Never submit a raw `.xcarchive` app directly. The
+pipeline now verifies every helper for both architectures before submission and
+notarizes `distribution/SCHEME/PRODUCT.app`. The rejected request and package are
+preserved; the corrected distribution package uses a distinct request record.
+
+Notary credential lookup was verified using the default data-protection Keychain.
+An explicit login.keychain-db lookup does not find that profile; do not force a
+file-based Keychain when using the existing default-store profile.

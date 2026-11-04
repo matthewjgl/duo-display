@@ -46,6 +46,38 @@ def tools(derived):
     return derived / 'SourcePackages/artifacts/sparkle/Sparkle/bin'
 
 
+def verify_distribution_signature(app):
+    framework = app / 'Contents/Frameworks/Sparkle.framework'
+    nested = framework / 'Versions/B'
+    targets = [nested / 'Updater.app', nested / 'Autoupdate',
+               nested / 'XPCServices/Downloader.xpc', nested / 'XPCServices/Installer.xpc',
+               framework, app]
+    for target in targets:
+        run('codesign', '--verify', '--deep', '--strict', str(target))
+        for arch in ('arm64', 'x86_64'):
+            signature = subprocess.run(['codesign', '-dv', '--verbose=4', '--arch', arch, str(target)],
+                                       capture_output=True, text=True, check=True).stderr
+            if (f'TeamIdentifier={TEAM}' not in signature or IDENTITY not in signature
+                    or 'runtime' not in signature or 'Timestamp=' not in signature
+                    or '(adhoc' in signature):
+                raise RuntimeError(f'Invalid distribution signing or timestamp: {target} ({arch})')
+
+
+def export_distributions(out):
+    options = out / 'ExportOptions-developer-id.plist'
+    options.write_bytes(plistlib.dumps({'destination': 'export', 'method': 'developer-id',
+        'signingStyle': 'manual', 'signingCertificate': 'Developer ID Application',
+        'teamID': TEAM, 'manageAppVersionAndBuildNumber': False}))
+    for scheme, product, _, _, _ in PRODUCTS:
+        destination = out / 'distribution' / scheme
+        app = destination / f'{product}.app'
+        if not app.exists():
+            run('xcodebuild', '-exportArchive', '-archivePath', str(out / f'{scheme}.xcarchive'),
+                '-exportPath', str(destination), '-exportOptionsPlist', str(options),
+                log=out / f'{scheme}-export.log')
+        verify_distribution_signature(app)
+
+
 def validate_feed(path, version, build, asset):
     ns = '{http://www.andymatuschak.org/xml-namespaces/sparkle}'
     tree = ET.parse(path)
@@ -139,6 +171,7 @@ def prepare(args):
         assert IDENTITY in signature
         archs = run('lipo', '-archs', str(app / 'Contents/MacOS' / product))
         assert 'arm64' in archs and 'x86_64' in archs
+    export_distributions(out)
     metadata['state'] = 'awaiting-notarization'
     save(out / 'release.json', metadata)
     if args.build_only:
@@ -171,15 +204,17 @@ def finish_notarization(out, profile):
     metadata = json.loads((out / 'release.json').read_text())
     if metadata['state'] not in ('awaiting-notarization', 'ready-for-draft'):
         raise RuntimeError('Signed archive preparation is incomplete')
+    export_distributions(out)
+    metadata['distribution_packaging'] = 'Xcode Developer ID export, including nested Sparkle helpers'
     args = argparse.Namespace(version=metadata['version'], build=metadata['build'])
     source = out / 'source'
     derived = out / 'DerivedData'
     for scheme, product, bundle, feed, minimum in PRODUCTS:
-        app = out / f'{scheme}.xcarchive/Products/Applications/{product}.app'
-        zipfile = out / f'{product.replace(" ", "")}-notary.zip'
+        app = out / 'distribution' / scheme / f'{product}.app'
+        zipfile = out / f'{product.replace(" ", "")}-distribution-notary.zip'
         if not zipfile.exists():
             run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(zipfile))
-        notarize(zipfile, out / f'{scheme}-app-notary', profile)
+        notarize(zipfile, out / f'{scheme}-distribution-app-notary', profile)
         run('xcrun', 'stapler', 'staple', str(app))
         run('xcrun', 'stapler', 'validate', str(app))
         run('spctl', '--assess', '--type', 'execute', '--verbose=2', str(app))
