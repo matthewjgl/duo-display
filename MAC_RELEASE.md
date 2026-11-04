@@ -88,7 +88,9 @@ source snapshot: `ae4a8a386818c286adce10713d0afd24be80f793ae4dfd0639197982d30286
 The public source repository is now https://github.com/matthewjgl/duo-display.
 Its source was verified against both frozen archives. The signed appcast and
 archive smoke test passes, and a tampered archive is rejected. Apple notarization
-is waiting for the owner to save the `DuoDisplay` Keychain credential profile.
+has accepted both exported apps and both signed disk images. The existing
+`DuoDisplay` credential profile works through the default data-protection Keychain.
+Final release-feed generation is awaiting local authorization of the Sparkle key.
 Public feed/download verification waits until an approved release is published.
 No public Mac release has been made. Live USB/Wi-Fi streaming was not re-tested
 as part of release setup.

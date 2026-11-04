@@ -202,13 +202,14 @@ def notarize(path, record, profile):
 
 def finish_notarization(out, profile):
     metadata = json.loads((out / 'release.json').read_text())
-    if metadata['state'] not in ('awaiting-notarization', 'ready-for-draft'):
+    if metadata['state'] not in ('awaiting-notarization', 'awaiting-feed-signing', 'ready-for-draft'):
         raise RuntimeError('Signed archive preparation is incomplete')
     export_distributions(out)
     metadata['distribution_packaging'] = 'Xcode Developer ID export, including nested Sparkle helpers'
     args = argparse.Namespace(version=metadata['version'], build=metadata['build'])
     source = out / 'source'
     derived = out / 'DerivedData'
+    prepared_feeds = []
     for scheme, product, bundle, feed, minimum in PRODUCTS:
         app = out / 'distribution' / scheme / f'{product}.app'
         zipfile = out / f'{product.replace(" ", "")}-distribution-notary.zip'
@@ -235,6 +236,11 @@ def finish_notarization(out, profile):
         feed_dir = out / f'{scheme}-feed'
         feed_dir.mkdir(exist_ok=True)
         shutil.copy2(dmg, feed_dir / dmg.name)
+        prepared_feeds.append((feed, feed_dir, dmg))
+    metadata['state'] = 'awaiting-feed-signing'
+    save(out / 'release.json', metadata)
+    # Finish all Apple-side work before requesting the Sparkle signing key.
+    for feed, feed_dir, dmg in prepared_feeds:
         run(str(tools(derived) / 'generate_appcast'), '--account', ACCOUNT, '--maximum-deltas', '0',
             '--download-url-prefix', f'https://github.com/{REPO}/releases/download/v{args.version}/',
             '--link', 'https://myduodisplay.com', '-o', str(out / feed), str(feed_dir))
