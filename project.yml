@@ -1,0 +1,218 @@
+name: OpenSidecar
+options:
+  createIntermediateGroups: true
+# Swift Package Manager dependencies. Sparkle powers the macOS app's
+# out-of-store auto-update (issue #52); it's an embedded open-source
+# framework + CLI tooling, not a hosted service — the appcast feed and the
+# DMG are served from infrastructure we already own (GitHub Pages + Releases).
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    # 2.x is the current major (latest 2.9.x) and the first Sparkle line to
+    # support SPM. `from:` allows compatible 2.x updates.
+    from: "2.6.0"
+schemes:
+  OpenSidecarMac:
+    build:
+      targets:
+        OpenSidecarMac: all
+    test:
+      targets:
+        - OpenSidecarMacTests
+  OpenSidecariOS:
+    build:
+      targets:
+        OpenSidecariOS: all
+  OpenSidecarMacReceiver:
+    build:
+      targets:
+        OpenSidecarMacReceiver: all
+# DEVELOPMENT_TEAM comes from the environment (see generate.sh / .env) so no
+# personal team ID lives in the repo. Unset = unsigned, fine for CI.
+settings:
+  base:
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.9"
+    # Version defaults for local builds. CI overrides both via xcargs:
+    # MARKETING_VERSION from the release tag, CURRENT_PROJECT_VERSION from
+    # the GitHub Actions run number (monotonic, keeps TestFlight builds unique).
+    MARKETING_VERSION: "0.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  OpenSidecarMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - Mac
+      - Shared
+    dependencies:
+      - package: Sparkle
+    info:
+      path: Mac/Info.plist
+      properties:
+        NSPrincipalClass: NSApplication
+        CFBundleDisplayName: $(BUNDLE_DISPLAY_NAME)
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSUIElement: true
+        NSLocalNetworkUsageDescription: Duo Display connects to your iPad or iPhone over the local network in WiFi mode.
+        NSBonjourServices: ["_opensidecar._tcp"]
+        LSApplicationCategoryType: public.app-category.utilities
+        # Duo Display feeds are release assets, independent of website deployment.
+        SUFeedURL: https://github.com/matthewjgl/duo-display/releases/latest/download/appcast.xml
+        SUPublicEDKey: pAj0T+PDqbB6WnRtzUDlnK+FJcQzJWrjMOX6dIymfUU=
+        SUEnableAutomaticChecks: true
+        SUAutomaticallyUpdate: false
+        SURequireSignedFeed: true
+        SUVerifyUpdateBeforeExtraction: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.mac
+        PRODUCT_NAME: Duo Display
+        BUNDLE_DISPLAY_NAME: Duo Display
+        SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: Mac/OpenSidecarMac.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        # Local dev builds get their own identity: TCC keys permission
+        # grants by bundle ID + code signature, so a Debug build sharing
+        # the release bundle ID knocks out the release app's Screen
+        # Recording/Accessibility grants every time the binary changes.
+        # PRODUCT_NAME (not BUNDLE_DISPLAY_NAME) is what the permission
+        # lists show, so the Debug build must override it to appear as its
+        # own row instead of a second, indistinguishable "Duo Display".
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.mac.debug
+          PRODUCT_NAME: Duo Display Dev
+          BUNDLE_DISPLAY_NAME: Duo Display Dev
+          # Colour-inverted icon so the dev build is obvious in the Dock,
+          # cmd-tab and permission lists.
+          ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon-Dev
+  # The standalone receiver app (issues #82/#17/#241): a spare Mac as a
+  # display. Deliberately its own bundle with a much lower deployment target
+  # than the sender, which is pinned to 14 by its capture stack. Everything
+  # under Shared/ and the files listed from Mac/ must therefore compile at
+  # this floor; keep this the oldest macOS the receiver path supports.
+  OpenSidecarMacReceiver:
+    type: application
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources:
+      - MacReceiver
+      - Shared
+      - Mac/Log.swift
+      - Mac/LogPolicies.swift
+      - Mac/CheckForUpdatesView.swift
+    dependencies:
+      - package: Sparkle
+    info:
+      path: MacReceiver/Info.plist
+      properties:
+        NSPrincipalClass: NSApplication
+        CFBundleDisplayName: $(BUNDLE_DISPLAY_NAME)
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSLocalNetworkUsageDescription: Duo Display Receiver advertises itself on the local network so another Mac can connect and use this Mac as a display.
+        NSBonjourServices: ["_opensidecar._tcp"]
+        NSAppleEventsUsageDescription: Duo Display Receiver shuts this Mac down when the connected Mac asks it to.
+        LSApplicationCategoryType: public.app-category.utilities
+        # Duo Display feeds are release assets, independent of website deployment.
+        SUFeedURL: https://github.com/matthewjgl/duo-display/releases/latest/download/appcast-receiver.xml
+        SUPublicEDKey: pAj0T+PDqbB6WnRtzUDlnK+FJcQzJWrjMOX6dIymfUU=
+        SUEnableAutomaticChecks: true
+        SUAutomaticallyUpdate: false
+        SURequireSignedFeed: true
+        SUVerifyUpdateBeforeExtraction: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.mac.receiver
+        PRODUCT_NAME: Duo Display Receiver
+        BUNDLE_DISPLAY_NAME: Duo Display Receiver
+        # Log.swift's file locking helpers live in the C bridging header.
+        SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: MacReceiver/OpenSidecarMacReceiver.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.mac.receiver.debug
+          PRODUCT_NAME: Duo Display Receiver Dev
+          BUNDLE_DISPLAY_NAME: Duo Display Receiver Dev
+          ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon-Dev
+  OpenSidecarMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - MacTests
+      - Mac/DisplayArrangement.swift
+      - Mac/OriginRestore.swift
+      - Mac/StreamConfiguration.swift
+      - Mac/VirtualCanvasSizing.swift
+      - Mac/PhoneInfo.swift
+      - Mac/DesktopPolicy.swift
+      - Mac/CaptureSourceCheck.swift
+      - Mac/AndroidUSBFunction.swift
+      - Mac/TransportFailover.swift
+      - Mac/Log.swift
+      - Mac/LogPolicies.swift
+      - Shared/Protocol.swift
+      - Shared/TransportSwitch.swift
+      - Shared/DirectCable.swift
+      - Shared/LogSnapshot.swift
+      - MacReceiver/FullscreenPreference.swift
+      - iOS/ReceiverPanelGeometry.swift
+    settings:
+      base:
+        # A hostless test bundle: the sources under test are compiled straight
+        # into it, so there is no app to inject into and nothing to load from.
+        TEST_HOST: ""
+        BUNDLE_LOADER: ""
+        # Without this the bundle has no Info.plist and code signing refuses to
+        # run, which fails the build before a single test executes.
+        GENERATE_INFOPLIST_FILE: "YES"
+        SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
+  OpenSidecariOS:
+    type: application
+    platform: iOS
+    # iOS 15 is the lowest floor Xcode 27's SDK allows and the last stop that
+    # revives hardware (iPad Air 2, iPad mini 4, iPhone 6s/7/SE). See #72.
+    # Anything newer is used behind #available, never as a floor.
+    deploymentTarget: "15.0"
+    sources:
+      - iOS
+      - Shared
+    info:
+      path: iOS/Info.plist
+      properties:
+        CFBundleDisplayName: Duo Display
+        CFBundleIconName: AppIcon
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # The stream uses no encryption of its own, so the export-compliance
+        # answer is "no"; this skips the per-build question in App Store Connect.
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        # Lets a ProMotion iPhone run Core Animation / display links above
+        # 60 Hz (iPad already does). Used by the Metal renderer's 120 Hz hint.
+        CADisableMinimumFrameDurationOnPhone: true
+        # Full screen on iPadOS 26 and earlier, as before. From iOS 27 the
+        # app follows its window instead (an iPhone Duo's Split View, iPadOS
+        # 27 multitasking); the receiver reports whatever window it gets.
+        UIRequiresFullScreen: true
+        UIRequiresFullScreenIgnoredStartingWithVersion: "27"
+        NSLocalNetworkUsageDescription: Duo Display advertises itself on the local network so your Mac can connect over WiFi.
+        NSBonjourServices: ["_opensidecar._tcp"]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationPortraitUpsideDown
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

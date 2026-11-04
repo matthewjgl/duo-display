@@ -1,0 +1,12 @@
+name: Website publishing disabled
+# Duo Display production is manually deployed to Netlify from approved snapshots.
+# GitHub must never publish a website from this repository.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  explain:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Website deployment is manual and separate. See DEPLOYMENT.md in the local project.'

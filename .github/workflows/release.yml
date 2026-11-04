@@ -1,0 +1,27 @@
+name: Mac release readiness (manual)
+
+# Releases are signed/notarized locally; no private keys are copied to GitHub.
+# This workflow checks a chosen commit. It cannot publish an app or website.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release tooling
+        run: |
+          python3 -m unittest discover -s scripts/release -p 'test_*.py'
+          ruby -c fastlane/Fastfile
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build both Mac targets without distribution credentials
+        run: |
+          xcodebuild -project OpenSidecar.xcodeproj -scheme OpenSidecarMac -configuration Release -derivedDataPath build/ci CODE_SIGNING_ALLOWED=NO build
+          xcodebuild -project OpenSidecar.xcodeproj -scheme OpenSidecarMacReceiver -configuration Release -derivedDataPath build/ci CODE_SIGNING_ALLOWED=NO build
