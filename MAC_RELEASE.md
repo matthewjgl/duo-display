@@ -83,6 +83,17 @@ initial manual Duo Display installation.
 On 2026-11-04 both apps archived successfully as universal arm64/x86_64 version
 1.0.0 build 1, signed by the Developer ID identity for team 23222L722A. Frozen
 source snapshot: `ae4a8a386818c286adce10713d0afd24be80f793ae4dfd0639197982d30286df`.
-Apple notarization and public feed verification are pending account setup. No
-public Mac release has been made. Live USB/Wi-Fi streaming was not re-tested
-as part of the release tooling setup.
+The public source repository is now https://github.com/matthewjgl/duo-display.
+Its source was verified against both frozen archives. The signed appcast and
+archive smoke test passes, and a tampered archive is rejected. Apple notarization
+is waiting for the owner to save the `DuoDisplay` Keychain credential profile.
+Public feed/download verification waits until an approved release is published.
+No public Mac release has been made. Live USB/Wi-Fi streaming was not re-tested
+as part of release setup.
+
+The isolated publishing checkout is `build/github-duo-source` (with its own Git
+history and `origin`). The main development checkout retains its existing Git
+history and upstream remote. Copy only reviewed application/build source into the
+publishing checkout before an explicit source push; never copy websites, local
+notes, credentials or build output. The draft command verifies that every frozen
+application source file matches the exact public commit before uploading assets.
