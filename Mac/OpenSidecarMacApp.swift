@@ -1025,31 +1025,39 @@ final class SenderController: ObservableObject {
 @MainActor
 final class PermissionMonitor: ObservableObject {
     @Published var screenRecording = false
-    @Published var accessibility = false
-    private var timer: Timer?
+    @Published var inputControl = false
+    private var observations = Set<AnyCancellable>()
+    private var lastDiagnostic: String?
 
     init() {
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
-            Task { @MainActor in self.refresh() }
-        }
+        Timer.publish(every: 3, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.refresh() }
+            .store(in: &observations)
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in self?.refresh() }
+            .store(in: &observations)
     }
 
     func refresh() {
         screenRecording = CGPreflightScreenCaptureAccess()
-        accessibility = AXIsProcessTrusted()
+        inputControl = InputInjector.hasInputControlPermission
+        let diagnostic = "screenCapture=\(screenRecording) eventPosting=\(inputControl) axClient=\(AXIsProcessTrusted())"
+        if diagnostic != lastDiagnostic {
+            Log.info("Permission check: \(diagnostic) bundle=\(Bundle.main.bundleIdentifier ?? "unknown") path=\(Bundle.main.bundlePath)")
+            lastDiagnostic = diagnostic
+        }
     }
 
-    /// Fire the system permission dialog on demand. macOS only shows each
-    /// dialog once per reset — after that the call just (re)registers the
-    /// app in System Settings, so the row exists to toggle manually.
+    /// Request only on the user's Grant action, never while polling.
     func requestScreenRecording() {
         CGRequestScreenCaptureAccess()
         refresh()
     }
 
-    func requestAccessibility() {
-        _ = InputInjector.ensureAccessibilityPermission()
+    func requestInputControl() {
+        _ = InputInjector.requestInputControlPermission()
         refresh()
     }
 
@@ -1300,11 +1308,11 @@ struct ContentView: View {
                         request: { permissions.requestScreenRecording() }
                     )
                     permissionRow(
-                        "Accessibility",
-                        granted: permissions.accessibility,
-                        help: "Required for touch input from the device.",
+                        InputInjector.permissionSettingsName,
+                        granted: permissions.inputControl,
+                        help: "Allows taps, drags and scrolling from your device. Enable Duo Display in Privacy & Security → \(InputInjector.permissionSettingsName).",
                         anchor: "Privacy_Accessibility",
-                        request: { permissions.requestAccessibility() }
+                        request: { permissions.requestInputControl() }
                     )
                     // macOS offers no API to query Local Network access, so
                     // infer from discovery results and let the user check.
@@ -1315,6 +1323,8 @@ struct ContentView: View {
                         help: "Required for WiFi mode. If no device appears in the Devices list, allow Duo Display under Privacy & Security → Local Network on this Mac AND on the device — and keep the Duo Display app open there.",
                         anchor: "Privacy_LocalNetwork"
                     )
+            Button("Recheck permissions") { permissions.refresh() }
+                .controlSize(.small)
         }
     }
 

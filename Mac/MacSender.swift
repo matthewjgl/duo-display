@@ -476,18 +476,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 await reconfigure(latest)
             }
 
-            // Touch back-channel (Milestone 3). Needs Accessibility trust;
+            // Touch back-channel needs permission to synthesize CGEvents;
             // streaming works without it, so don't interrupt with a prompt —
             // the permission panel's Grant button asks when the user is ready.
-            if !AXIsProcessTrusted() {
-                await status("Extending — grant Accessibility for touch input")
+            if !InputInjector.hasInputControlPermission {
+                await status("Extending — allow \(InputInjector.permissionSettingsName) for touch input")
                 // Event posting is trust-checked per-post, so it starts working
                 // the moment the user grants — poll just to log/report it.
-                while !AXIsProcessTrusted() {
+                while !InputInjector.hasInputControlPermission {
                     try await Task.sleep(for: .seconds(2))
                     if stopped { return }
                 }
-                Log.info("Accessibility permission granted — touch input live")
+                Log.info("Event-posting permission granted — touch input permitted")
             }
         }
     }

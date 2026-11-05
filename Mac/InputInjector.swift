@@ -62,13 +62,21 @@ final class InputInjector {
         self.displayID = displayID
     }
 
-    static func ensureAccessibilityPermission() -> Bool {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-        let trusted = AXIsProcessTrustedWithOptions(options)
-        if !trusted {
-            Log.info("Accessibility permission missing — prompt requested")
+    /// Touch control posts CGEvents; check the permission for that capability,
+    /// rather than trust for reading/manipulating other apps' AX element trees.
+    static var hasInputControlPermission: Bool { CGPreflightPostEventAccess() }
+
+    static var permissionSettingsName: String {
+        if #available(macOS 27, *) { return "Device Control and Data Access" }
+        return "Accessibility"
+    }
+
+    static func requestInputControlPermission() -> Bool {
+        let granted = CGRequestPostEventAccess()
+        if !granted {
+            Log.info("Event-posting permission missing — system request issued")
         }
-        return trusted
+        return granted
     }
 
     /// x/y are normalized [0,1] in video space (origin top-left).
