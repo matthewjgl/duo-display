@@ -35,7 +35,7 @@ struct CheckForUpdatesView: View {
 
 /// Compact navigation keeps the device list separate from persistent preferences.
 enum DuoMacPage: String, CaseIterable, Identifiable {
-    case devices = "Devices", picture = "Picture", app = "App settings", permissions = "Permissions"
+    case devices = "Displays", picture = "Streaming", app = "Preferences", permissions = "Permissions"
     var id: String { rawValue }
     var symbol: String {
         switch self {
@@ -47,10 +47,10 @@ enum DuoMacPage: String, CaseIterable, Identifiable {
     }
     var subtitle: String {
         switch self {
-        case .devices: return "Your screens, together."
-        case .picture: return "Choose how your extra screen looks."
-        case .app: return "Set up your everyday workflow."
-        case .permissions: return "Everything your connection needs."
+        case .devices: return "Connect a device. Make room for what’s next."
+        case .picture: return "Fine-tune your connected displays."
+        case .app: return "Make Duo Display fit your workflow."
+        case .permissions: return "Allow capture and control, with clear access status."
         }
     }
 }
@@ -74,8 +74,63 @@ struct DuoMacCard<Content: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
         .background(RoundedRectangle(cornerRadius: 14)
-            .fill(Color(nsColor: .controlBackgroundColor)))
+            .fill(Color(nsColor: .textBackgroundColor)))
         .overlay(RoundedRectangle(cornerRadius: 14)
             .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1))
+    }
+}
+
+
+enum DuoMacTheme {
+    static let accent = Color(nsColor: .systemBlue)
+}
+
+struct DuoMacStatusPill: View {
+    let title: String
+    let color: Color
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(title).font(.caption.weight(.medium))
+        }
+        .padding(.horizontal, 9).padding(.vertical, 5)
+        .background(Capsule().fill(color.opacity(0.09)))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct DuoWorkspaceOverview: View {
+    let connected: Bool
+    let extended: Bool
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack {
+                Label("Display overview", systemImage: "rectangle.3.group")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Text(connected ? (extended ? "Extended desktop" : "Mirrored desktop") : "Waiting for a device")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack(alignment: .center, spacing: 24) {
+                Spacer(minLength: 0)
+                VStack(spacing: 10) {
+                    Image(systemName: "laptopcomputer").font(.system(size: 56, weight: .ultraLight))
+                    Text("This Mac").font(.caption.weight(.medium))
+                }
+                Image(systemName: connected ? "link" : "plus")
+                    .font(.system(size: 19, weight: .light)).foregroundStyle(.secondary)
+                VStack(spacing: 10) {
+                    Image(systemName: "ipad.landscape").font(.system(size: 45, weight: .ultraLight))
+                    Text(connected ? "Your second screen" : "Your next screen").font(.caption.weight(.medium))
+                }
+                .foregroundStyle(connected ? DuoMacTheme.accent : Color.secondary)
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 6)
+        }
+        .padding(20).frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: 14).fill(DuoMacTheme.accent.opacity(0.045)))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(DuoMacTheme.accent.opacity(0.12)))
+        .accessibilityElement(children: .combine)
     }
 }

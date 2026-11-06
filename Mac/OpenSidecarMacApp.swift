@@ -1074,27 +1074,34 @@ struct ContentView: View {
     // Retained for the future signed Duo Display update integration.
     let updater: SPUStandardUpdaterController?
 
-    static let size = CGSize(width: 660, height: 600)
+    static let size = CGSize(width: 820, height: 640)
     @State private var page: DuoMacPage = .devices
+
+    private var missingPermissions: Int {
+        (permissions.screenRecording ? 0 : 1) + (permissions.inputControl ? 0 : 1)
+    }
 
     var body: some View {
         HStack(spacing: 0) {
             sidebar
             Divider()
             VStack(spacing: 0) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(page.rawValue).font(.system(size: 26, weight: .bold))
-                        Text(page.subtitle).font(.callout).foregroundStyle(.secondary)
+                HStack(alignment: .center, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(page.rawValue).font(.system(size: 25, weight: .bold))
+                        Text(page.subtitle).font(.subheadline).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if controller.running {
-                        Button("Disconnect All") { controller.disconnectAll() }
+                    if page == .devices {
+                        Button(action: arrangeDisplays) {
+                            Label("Arrange Displays…", systemImage: "rectangle.3.group")
+                        }
+                        .help("Open System Settings to position your extended displays.")
                     }
                 }
-                .padding(24)
+                .padding(.horizontal, 28).padding(.top, 26).padding(.bottom, 20)
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 20) {
                         switch page {
                         case .devices: devicesPage
                         case .picture: picturePage
@@ -1102,17 +1109,18 @@ struct ContentView: View {
                         case .permissions: permissionsPage
                         }
                     }
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 24)
+                    .padding(.horizontal, 28).padding(.bottom, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 Divider()
-                HStack {
+                HStack(spacing: 12) {
+                    DuoMacStatusPill(title: controller.running ? "Connected" : "Ready to connect",
+                                     color: controller.running ? .green : .secondary)
+                    Spacer()
                     Button("Logs") { Log.revealInFinder() }
                         .help("Reveal the Duo Display log files in Finder")
                     if let updater { CheckForUpdatesView(updater: updater) }
                     else { Link("Updates", destination: URL(string: "https://myduodisplay.com/download")!) }
-                    Spacer()
                     Button("Quit") { NSApp.terminate(nil) }
                 }
                 .controlSize(.small)
@@ -1123,119 +1131,137 @@ struct ContentView: View {
         }
         .frame(width: Self.size.width, height: Self.size.height)
         .toggleStyle(.switch)
+        .accentColor(DuoMacTheme.accent)
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            VStack(alignment: .leading, spacing: 10) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable().frame(width: 48, height: 48)
-                Text("Duo Display").font(.system(size: 17, weight: .bold))
-                Text("A little more room.").font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 28) {
+            HStack(spacing: 8) {
+                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 32, height: 32)
+                Text("Duo Display").font(.system(size: 15, weight: .semibold))
             }
-            .padding(.horizontal, 10)
-            VStack(spacing: 5) {
+            .padding(.horizontal, 8).padding(.top, 10)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Workspace").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
                 ForEach(DuoMacPage.allCases) { item in
                     Button { page = item } label: {
-                        Label(item.rawValue, systemImage: item.symbol)
-                            .font(.system(size: 13, weight: page == item ? .semibold : .regular))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 10).padding(.vertical, 10)
-                            .foregroundStyle(page == item ? Color.accentColor : Color.primary)
-                            .background(RoundedRectangle(cornerRadius: 9)
-                                .fill(page == item ? Color.accentColor.opacity(0.12) : Color.clear))
+                        HStack(spacing: 10) {
+                            Image(systemName: item.symbol).frame(width: 18)
+                            Text(item.rawValue)
+                            Spacer(minLength: 0)
+                            if item == .permissions && missingPermissions > 0 {
+                                Text("\(missingPermissions)").font(.caption2.weight(.bold))
+                                    .padding(.horizontal, 5).padding(.vertical, 2)
+                                    .background(Capsule().fill(Color.orange.opacity(0.16)))
+                            }
+                        }
+                        .font(.system(size: 13, weight: page == item ? .semibold : .regular))
+                        .padding(.horizontal, 10).padding(.vertical, 9)
+                        .foregroundStyle(page == item ? DuoMacTheme.accent : Color.primary)
+                        .background(RoundedRectangle(cornerRadius: 8)
+                            .fill(page == item ? DuoMacTheme.accent.opacity(0.12) : Color.clear))
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(page == item ? .isSelected : [])
                 }
             }
             Spacer()
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
-                    Circle().fill(controller.running ? Color.green : Color.secondary)
-                        .frame(width: 7, height: 7)
-                    Text(controller.running ? "Connected" : "Not connected")
-                        .font(.caption.weight(.medium))
+            Button { page = .permissions } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(missingPermissions == 0 ? "Setup complete" : "Finish setup",
+                          systemImage: missingPermissions == 0 ? "checkmark.shield" : "lock.shield")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(missingPermissions == 0 ? Color.secondary : Color.orange)
+                    Text(missingPermissions == 0 ? "Ready for your devices" : "\(missingPermissions) permission\(missingPermissions == 1 ? "" : "s") needed")
+                        .font(.caption2).foregroundStyle(.secondary)
                 }
-                Text(controller.running
-                     ? "\(controller.sessions.count) active device\(controller.sessions.count == 1 ? "" : "s")"
-                     : "USB or Wi-Fi")
-                    .font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
-            .padding(10)
+            .buttonStyle(.plain)
         }
-        .padding(14)
-        .frame(width: 156)
-        .frame(maxHeight: .infinity)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .padding(14).frame(width: 194).frame(maxHeight: .infinity)
+        .background(.regularMaterial)
+    }
+
+    private func arrangeDisplays() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Displays-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     private var devicesPage: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 16) {
-                Image(systemName: "laptopcomputer").font(.system(size: 42, weight: .light))
-                Image(systemName: "arrow.left.arrow.right").font(.title3).foregroundStyle(.secondary)
-                Image(systemName: "ipad.landscape").font(.system(size: 35, weight: .light))
-                Spacer(minLength: 0)
+        VStack(alignment: .leading, spacing: 20) {
+            DuoWorkspaceOverview(connected: controller.running,
+                                 extended: controller.mode == .extend)
+            HStack {
+                Text(controller.running ? "Your displays" : "Nearby devices").font(.headline)
+                Text("\(controller.deviceEntries.count)")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Spacer()
+                Label("USB & Wi-Fi", systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            .foregroundStyle(Color.accentColor)
-            .padding(22)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 16).fill(Color.accentColor.opacity(0.07)))
-            DuoMacCard("Available screens", symbol: "rectangle.on.rectangle") {
-                if controller.deviceEntries.isEmpty {
-                    Text("Your next screen will appear here.").font(.headline)
-                    Text("Connect a device with USB, or open Duo Display on a device on the same Wi-Fi network.")
-                        .font(.callout).foregroundStyle(.secondary)
+            if controller.deviceEntries.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "iphone.radiowaves.left.and.right")
+                        .font(.system(size: 28, weight: .light)).foregroundStyle(DuoMacTheme.accent)
+                    Text("Bring your next screen online").font(.headline)
+                    Text("Open Duo Display on your iPhone, iPad or Mac.\nConnect a USB cable or join the same Wi-Fi network.")
+                        .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 }
-                    ForEach(controller.deviceEntries) { entry in
-                        if let session = controller.session(for: entry) {
-                            // Title from the entry, not the session: the
-                            // session name was snapshotted at connect time,
-                            // often before lockdown resolved the real name.
-                            SessionRow(title: entry.name, session: session,
-                                       controller: controller)
-                        } else {
-                            HStack(alignment: .firstTextBaseline) {
-                                Circle()
-                                    .fill(.secondary.opacity(0.5))
-                                    .frame(width: 9, height: 9)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(entry.name)
-                                    Text(entry.transportLabel)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                if let target = entry.preferredTarget {
-                                    Button("Connect") {
-                                        controller.connect(to: target, userInitiated: true)
-                                    }
-                                    .controlSize(.small)
-                                }
+                .padding(28).frame(maxWidth: .infinity)
+                .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .textBackgroundColor)))
+            }
+            ForEach(controller.deviceEntries) { entry in
+                VStack(alignment: .leading, spacing: 12) {
+                    if let session = controller.session(for: entry) {
+                        SessionRow(title: entry.name, session: session, controller: controller)
+                    } else {
+                        HStack(spacing: 14) {
+                            Image(systemName: "display.2").font(.title2)
+                                .foregroundStyle(DuoMacTheme.accent).frame(width: 40, height: 44)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(DuoMacTheme.accent.opacity(0.08)))
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(entry.name).font(.headline)
+                                Label(entry.transportLabel, systemImage: entry.usbTarget == nil ? "wifi" : "cable.connector")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if let target = entry.preferredTarget {
+                                Button("Connect") { controller.connect(to: target, userInitiated: true) }
+                                    .buttonStyle(.borderedProminent).controlSize(.large)
                             }
                         }
                     }
-            }
-            Button {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.Displays-Settings.extension") {
-                    NSWorkspace.shared.open(url)
                 }
-            } label: {
-                Label("Arrange Displays…", systemImage: "rectangle.3.group")
+                .padding(18).frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .textBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.primary.opacity(0.06)))
             }
-            .help("Position your extended screens in System Settings → Displays.")
+            if controller.running {
+                HStack {
+                    Text("Stream controls apply to every connected display.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Disconnect All") { controller.disconnectAll() }
+                }
+            }
         }
     }
 
     private var picturePage: some View {
-        DuoMacCard("Display & stream", symbol: "display") {
+        DuoMacCard("Picture & performance", symbol: "display") {
+                Text("Display mode").font(.headline)
                 Picker("Mode", selection: $controller.mode) {
                     Text("Extend").tag(CaptureMode.extend)
                     Text("Mirror").tag(CaptureMode.mirror)
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: controller.mode) { controller.restartAll() }
+                Text(controller.mode == .extend ? "Add an independent desktop beside your Mac." : "Show the same desktop on both screens.")
+                    .font(.subheadline).foregroundStyle(.secondary)
+                Divider().padding(.vertical, 4)
 
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Quality", selection: $controller.quality) {

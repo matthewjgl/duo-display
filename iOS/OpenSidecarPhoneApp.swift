@@ -86,7 +86,9 @@ struct ReceiverScreen: View {
                         .accessibilityHint("Adjust your display, video and touch settings")
                     }
                 }
-                .duoStreamingChrome(isStreaming)
+                .navigationTitle(isStreaming ? "" : "Duo Display")
+                .navigationBarTitleDisplayMode(.inline)
+                .duoStreamingChrome(isStreaming, showSettings: $showSettings)
         }
     }
 
@@ -266,50 +268,112 @@ struct TransportSwitchOverlay: View {
 struct IdleView: View {
     @ObservedObject var receiver: StreamReceiver
     @Binding var showSettings: Bool
+    @State private var connectionHelp = 0
+    @AppStorage("deviceName") private var deviceName = UIDevice.current.name
+    @ScaledMetric(relativeTo: .largeTitle) private var titleSize = 30.0
+
+    private var needsAttention: Bool { receiver.status.localizedCaseInsensitiveContains("fail") }
+    private var heading: String {
+        if receiver.connected { return "Getting your\ndisplay ready." }
+        if needsAttention { return "Let’s get you\nconnected." }
+        return "Your next\nscreen is ready."
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                HStack(spacing: 10) {
-                    Image("AppLogo").resizable().scaledToFit()
-                        .frame(width: 62, height: 46).accessibilityHidden(true)
-                    Text("Duo Display").font(.title3.bold())
-                }
-                .padding(.top, 16)
-
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("A little more\nroom to work.")
-                        .font(.largeTitle.bold()).tracking(-1)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 7) {
-                        Circle().fill(receiver.connected ? Color.green : Color.blue)
-                            .frame(width: 7, height: 7)
-                        Text(receiver.status).font(.subheadline.weight(.medium))
+        GeometryReader { geometry in
+            ScrollView {
+                Group {
+                    if geometry.size.width > 650 {
+                        HStack(alignment: .center, spacing: 48) {
+                            welcome.frame(maxWidth: .infinity)
+                            pairing.frame(maxWidth: .infinity)
+                        }
+                        .padding(.vertical, 28)
+                    } else {
+                        VStack(spacing: 20) {
+                            welcome
+                            pairing
+                        }
+                        .padding(.top, 8)
                     }
-                    .foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: 880)
+                .padding(.horizontal, 24).padding(.bottom, 28)
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .background(Color(.systemBackground))
+        .tint(DuoPhoneTheme.accent)
+    }
 
-                DuoSettingsCard("Connect your Mac") {
-                    DuoConnectionOption(symbol: "cable.connector", title: "Plug in and go",
-                        detail: "Connect a USB cable, then open Duo Display on your Mac.")
-                    Divider()
-                    DuoConnectionOption(symbol: "wifi", title: "Or use Wi-Fi",
-                        detail: "Join the same network, then select this \(deviceKind) in the Mac app.")
+    private var welcome: some View {
+        VStack(spacing: 12) {
+            Image("AppLogo").resizable().scaledToFit()
+                .frame(width: 68, height: 46).accessibilityHidden(true)
+                .padding(.bottom, 4)
+            Text(heading).font(.system(size: titleSize, weight: .bold)).tracking(-1.1)
+                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+                .accessibilityAddTraits(.isHeader)
+            Text(receiver.connected ? "Keep this app open. Your Mac is starting the stream." : "Connect from your Mac.")
+                .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 7) {
+                if receiver.connected { ProgressView().controlSize(.small) }
+                else { Circle().fill(needsAttention ? Color.orange : DuoPhoneTheme.accent).frame(width: 7, height: 7) }
+                Text(receiver.connected ? "Preparing your display" : receiver.status)
+                    .font(.subheadline.weight(.medium))
+            }
+            .padding(.horizontal, 14).padding(.vertical, 9)
+            .background(Capsule().fill(Color(.secondarySystemBackground)))
+            .accessibilityElement(children: .combine)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var pairing: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Picker("Connection instructions", selection: $connectionHelp) {
+                Text("USB").tag(0)
+                Text("Wi-Fi").tag(1)
+            }
+            .pickerStyle(.segmented)
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 12) {
+                    Image(systemName: connectionHelp == 0 ? "cable.connector" : "wifi")
+                        .font(.system(size: 22, weight: .medium)).foregroundStyle(DuoPhoneTheme.accent)
+                        .frame(width: 40, height: 40)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(DuoPhoneTheme.accent.opacity(0.09)))
+                    Text(connectionHelp == 0 ? "Plug in. Spread out." : "More space. No cable.")
+                        .font(.headline).fixedSize(horizontal: false, vertical: true)
                 }
-
-                Label("Keep this app open. Your Mac starts the stream.", systemImage: "play.circle")
+                Text(connectionHelp == 0
+                     ? "Connect this \(deviceKind) to your Mac with USB. Open Duo Display on your Mac and choose this device."
+                     : "Put both devices on the same Wi-Fi network. Open Duo Display on your Mac, then choose the name below.")
                     .font(.subheadline).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-
-                Text("You can also shake your \(deviceKind) to open Settings.")
-                    .font(.footnote).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                Divider()
+                HStack(spacing: 12) {
+                    Image(systemName: "iphone").foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Look for this device").font(.caption).foregroundStyle(.secondary)
+                        Text(deviceName).font(.subheadline.weight(.semibold)).lineLimit(2)
+                    }
+                    Spacer(minLength: 0)
+                }
             }
-            .frame(maxWidth: 520, alignment: .leading)
-            .padding(24).frame(maxWidth: .infinity)
+            .padding(20).frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 22).fill(Color(.secondarySystemBackground)))
+            Label("Keep Duo Display open while using your second screen.", systemImage: "display")
+                .font(.footnote).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 4)
         }
-        .background(Color(.systemGroupedBackground))
+        .frame(maxWidth: 440)
     }
+}
+
+private enum DuoPhoneTheme {
+    static let accent = Color(uiColor: .systemBlue)
 }
 
 private struct DuoConnectionOption: View {
@@ -389,7 +453,7 @@ struct OnboardingView: View {
                         .padding(.top, 24)
 
                     VStack(spacing: 10) {
-                        Text("One more app to go")
+                        Text("Two devices. One workspace.")
                             .font(.title2.bold())
                             .multilineTextAlignment(.center)
                         Text("Duo Display turns this \(deviceKind) into a second screen for your Mac. It needs the **Duo Display Mac app** running on a Mac connected by the same USB cable or on the same WiFi network.")
@@ -473,123 +537,82 @@ struct SettingsView: View {
 
     var body: some View {
         AdaptiveNavigation {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Make room for you.").font(.title.bold()).tracking(-0.6)
-                        Text("Tune your second screen.").foregroundStyle(.secondary)
-                    }.padding(.vertical, 8)
-                    connectionCard
-                    statsCard
-                    controlsCard
-                    helpCard
-                    aboutCard
+            Form {
+                Section {
+                    HStack(spacing: 12) {
+                        Image(systemName: receiver.connected ? "link" : "antenna.radiowaves.left.and.right")
+                            .font(.title3).foregroundStyle(receiver.connected ? Color.green : DuoPhoneTheme.accent)
+                            .frame(width: 28)
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(receiver.connected ? "Connected to your Mac" : "Waiting for your Mac")
+                                .font(.headline)
+                            Text(receiver.status).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }.padding(.vertical, 4)
+                    if receiver.videoSize != .zero {
+                        LabeledRow("Resolution", value: "\(Int(receiver.videoSize.width)) × \(Int(receiver.videoSize.height))")
+                        LabeledRow("Frame rate", value: "\(receiver.fps) FPS")
+                    }
+                    HStack {
+                        Text("Device name")
+                        DeviceNameField { receiver.setServiceName($0) }.multilineTextAlignment(.trailing)
+                    }
+                } header: { Text("Connection") } footer: {
+                    Text("Your Mac finds this name in Duo Display’s device list.")
                 }
-                .frame(maxWidth: 560, alignment: .leading)
-                .padding(20).frame(maxWidth: .infinity)
+
+                Section {
+                    Picker("On-screen stats", selection: statsMode) {
+                        Text("Off").tag(0)
+                        Text("Compact").tag(1)
+                        Text("Detailed").tag(2)
+                    }.pickerStyle(.segmented)
+                    Text(statsDescription).font(.footnote).foregroundStyle(.secondary)
+                } header: { Text("On-screen stats") }
+
+                Section {
+                    Toggle(isOn: $touchRipple) {
+                        Label("Touch feedback", systemImage: "hand.tap")
+                    }
+                    NavigationLink { DuoRenderingSettings() } label: {
+                        Label("Advanced video", systemImage: "slider.horizontal.3")
+                    }
+                } header: { Text("Display & touch") } footer: {
+                    Text("Touch feedback adds a small ripple where you tap. Turning it off leaves your gestures unchanged.")
+                }
+
+                Section {
+                    Link(destination: macAppURL) { Label("Get the Mac app", systemImage: "arrow.down.circle") }
+                    Button {
+                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                    } label: { Label("Wi-Fi permissions", systemImage: "wifi") }
+                    NavigationLink { DiagnosticsLogView() } label: {
+                        Label("Connection log", systemImage: "doc.text.magnifyingglass")
+                    }
+                } header: { Text("Help") } footer: {
+                    Text("Wi-Fi needs both devices on the same network and Local Network access. Logs stay on this device unless you share them.")
+                }
+
+                Section {
+                    LabeledRow("Duo Display", value: version)
+                    Link("myduodisplay.com", destination: URL(string: "https://myduodisplay.com")!)
+                    Link("Source & licenses", destination: URL(string: "https://github.com/peetzweg/opendisplay")!)
+                    if AppStore.isPubliclyAvailable { Link("Rate Duo Display", destination: AppStore.reviewURL) }
+                } header: { Text("About") }
             }
+            .frame(maxWidth: 680).frame(maxWidth: .infinity)
             .background(Color(.systemGroupedBackground))
-            .navigationTitle("Duo Display")
+            .navigationTitle("Display settings")
             .navigationBarTitleDisplayMode(.inline)
+            .tint(DuoPhoneTheme.accent)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button { dismiss() } label: {
-                        Label("Done", systemImage: "checkmark")
-                    }
-                    .labelStyle(.iconOnly)
+                    Button { dismiss() } label: { Label("Done", systemImage: "checkmark") }
+                        .labelStyle(.iconOnly)
                 }
             }
             .onAppear {
-                // Existing installs may have enabled both old overlay switches.
                 if showAnalytics && showLatencyHUD { showLatencyHUD = false }
-            }
-        }
-    }
-
-    private var connectionCard: some View {
-        DuoSettingsCard("Your connection") {
-            HStack(spacing: 8) {
-                Circle().fill(receiver.connected ? Color.green : Color.blue).frame(width: 8, height: 8)
-                Text(receiver.connected ? "Connected to your Mac" : "Ready for your Mac")
-                    .font(.subheadline.weight(.medium))
-            }
-            if receiver.videoSize != .zero {
-                Text("\(Int(receiver.videoSize.width)) × \(Int(receiver.videoSize.height)) · \(receiver.fps) FPS")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            }
-            Divider()
-            Text("Name on your Mac").font(.subheadline.weight(.medium))
-            DeviceNameField { receiver.setServiceName($0) }
-                .padding(12).background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 12))
-            Text("This is the name you’ll see in Duo Display’s Wi-Fi device list.")
-                .font(.footnote).foregroundStyle(.secondary)
-        }
-    }
-
-    private var statsCard: some View {
-        DuoSettingsCard("On-screen stats") {
-            Picker("On-screen stats", selection: statsMode) {
-                Text("Off").tag(0)
-                Text("Compact").tag(1)
-                Text("Detailed").tag(2)
-            }.pickerStyle(.segmented)
-            Text(statsDescription).font(.subheadline).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var controlsCard: some View {
-        DuoSettingsCard("Picture & touch") {
-            Toggle(isOn: $touchRipple) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("Show touch feedback").font(.subheadline.weight(.medium))
-                    Text("A small ripple shows where you tap. Your gestures work the same either way.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-            }
-            Divider()
-            NavigationLink { DuoRenderingSettings() } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "cube.transparent").foregroundStyle(.blue)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Advanced video").font(.subheadline.weight(.medium))
-                        Text("Renderer and frame buffering").font(.footnote).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                }
-                .foregroundStyle(.primary).padding(.vertical, 4)
-            }
-        }
-    }
-
-    private var helpCard: some View {
-        DuoSettingsCard("Need a hand?") {
-            Link(destination: macAppURL) { Label("Get the Mac app", systemImage: "arrow.down.circle") }
-            Divider()
-            Button {
-                if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
-            } label: { Label("Wi-Fi permissions", systemImage: "wifi") }
-            Text("For Wi-Fi, both devices need the same network. If your Mac can’t find this \(deviceKind), allow Local Network access in iOS Settings. USB works without that permission.")
-                .font(.footnote).foregroundStyle(.secondary)
-            Divider()
-            NavigationLink { DiagnosticsLogView() } label: {
-                Label("Connection log", systemImage: "doc.text.magnifyingglass")
-            }
-            Text("Logs stay on this device unless you choose to share them. They don’t contain your screen content.")
-                .font(.footnote).foregroundStyle(.secondary)
-        }
-        .font(.subheadline)
-    }
-
-    private var aboutCard: some View {
-        DuoSettingsCard("Made for a little more space") {
-            LabeledRow("Duo Display", value: version).font(.subheadline)
-            Link("myduodisplay.com", destination: URL(string: "https://myduodisplay.com")!)
-            Link("Source & licenses", destination: URL(string: "https://github.com/peetzweg/opendisplay")!)
-                .font(.footnote)
-            if AppStore.isPubliclyAvailable {
-                Link("Rate Duo Display", destination: AppStore.reviewURL)
             }
         }
     }
@@ -650,18 +673,49 @@ private struct DuoRenderingSettings: View {
 private struct DuoStreamingChrome: ViewModifier {
     @Environment(\.toolbarVerticalEdge) private var verticalEdge
     let streaming: Bool
+    @Binding var showSettings: Bool
     func body(content: Content) -> some View {
-        content.toolbar(streaming && verticalEdge == nil ? .hidden : .visible, for: .navigationBar)
+        content
+            .toolbar(streaming && verticalEdge == nil ? .hidden : .visible, for: .navigationBar)
+            .overlay {
+                if streaming && verticalEdge == nil {
+                    DuoFloatingSettings(showSettings: $showSettings)
+                }
+            }
+    }
+}
+
+private struct DuoFloatingSettings: View {
+    @Binding var showSettings: Bool
+    var body: some View {
+        GeometryReader { geometry in
+            VStack {
+                HStack {
+                    Spacer()
+                    Button { showSettings = true } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.body.weight(.medium)).foregroundStyle(.white)
+                            .frame(width: 44, height: 44)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .accessibilityLabel("Settings & help")
+                }
+                Spacer()
+            }
+            .padding(.top, geometry.safeAreaInsets.top + 8)
+            .padding(.trailing, geometry.safeAreaInsets.trailing + 12)
+        }
     }
 }
 
 extension View {
     @ViewBuilder
-    fileprivate func duoStreamingChrome(_ streaming: Bool) -> some View {
+    fileprivate func duoStreamingChrome(_ streaming: Bool, showSettings: Binding<Bool>) -> some View {
         if #available(iOS 27.1, *) {
-            modifier(DuoStreamingChrome(streaming: streaming))
+            modifier(DuoStreamingChrome(streaming: streaming, showSettings: showSettings))
         } else {
             navigationBarHidden(streaming)
+                .overlay { if streaming { DuoFloatingSettings(showSettings: showSettings) } }
         }
     }
 }
