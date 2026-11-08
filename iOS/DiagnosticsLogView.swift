@@ -15,7 +15,7 @@ struct DiagnosticsLogView: View {
     private static let displayedLines = 400
     private static let bottomAnchor = "bottom"
 
-    @AppStorage("deviceName") private var deviceName = UIDevice.current.name
+    @AppStorage("deviceName") private var deviceName = ""
     @State private var snapshot: Snapshot = .loading
     @State private var sharing = false
 
@@ -116,7 +116,7 @@ struct DiagnosticsLogView: View {
             appBuild: info?["CFBundleVersion"] as? String ?? "0",
             model: hardwareModel(),
             systemVersion: UIDevice.current.systemVersion,
-            deviceName: deviceName
+            deviceName: PhoneName.current(appName: deviceName).name
         )
     }
 

@@ -124,8 +124,14 @@ enum ConnectionTarget: Hashable {
 final class DeviceSession: ObservableObject, Identifiable {
     nonisolated let id: String
     let target: ConnectionTarget
+    /// The endpoint label the session was created with (a service name or a
+    /// cable name). Used for legacy service matching, never shown once a
+    /// resolved name exists: the UI shows `displayName`.
     let name: String
     let sender: MacSender
+    /// The resolved per-device name (custom, else automatic). Updated in
+    /// place by a rename: label only, the stream is untouched.
+    @Published var displayName: String
 
     @Published var status = "Starting…"
     @Published var framesSent = 0
@@ -236,6 +242,7 @@ final class DeviceSession: ObservableObject, Identifiable {
         self.id = id
         self.target = target
         self.name = name
+        self.displayName = name
         self.sender = sender
         if case .usb(let udid) = target {
             onUSB = true
@@ -313,7 +320,7 @@ final class SenderController: ObservableObject {
         var worst: Double?
         for session in sessions {
             let fresh = session.liveIsFresh(at: now)
-            lines.append("\(session.name): \(LiveStats.summary(session.live, fresh: fresh))")
+            lines.append("\(session.displayName): \(LiveStats.summary(session.live, fresh: fresh))")
             if fresh, let ms = session.live?.latencyMs { worst = max(worst ?? 0, ms) }
         }
         StatusItemTooltip.set(lines.isEmpty ? nil
@@ -365,8 +372,23 @@ final class SenderController: ObservableObject {
     // the moment an identity is learned.
     @Published private var installIDByUDID: [String: String] =
         UserDefaults.standard.dictionary(forKey: "installIDByUDID") as? [String: String] ?? [:] {
-        didSet { UserDefaults.standard.set(installIDByUDID, forKey: "installIDByUDID") }
+        didSet {
+            UserDefaults.standard.set(installIDByUDID, forKey: "installIDByUDID")
+            // A name set while the device was known only by its cable serial
+            // moves to its install id, so it follows it onto Wi-Fi too.
+            var moved = false
+            for (udid, id) in installIDByUDID where oldValue[udid] != id {
+                moved = DeviceNameStore.adopt(udid: udid, into: id) || moved
+            }
+            if moved { namesChanged() }
+        }
     }
+    /// Bumped whenever a stored device name changes, so the list re-renders.
+    @Published private(set) var nameRevision = 0 {
+        didSet { storedNameIDs = DeviceNameStore.allIDs() }
+    }
+    /// Devices with a stored name record (cached: the list renders often).
+    private var storedNameIDs = DeviceNameStore.allIDs()
     private let autoConnectEnabled = UserDefaults.standard.object(forKey: "autostart") == nil
         || UserDefaults.standard.bool(forKey: "autostart")
 
@@ -426,6 +448,7 @@ final class SenderController: ObservableObject {
             DispatchQueue.main.async {
                 guard let self, let browser, self.browser === browser else { return }
                 self.discovered = Array(results)
+                self.recordAdvertisedNames()
                 self.endSessionsWhoseServiceVanished()
                 // A cable pulled before the device's Wi-Fi service was seen
                 // fails over the moment it shows up (inside the grace).
@@ -459,6 +482,12 @@ final class SenderController: ObservableObject {
     private func txtID(of result: NWBrowser.Result) -> String? {
         if case .bonjour(let txt) = result.metadata { return txt["id"] }
         return nil
+    }
+
+    /// The name a receiver advertises (TXT `n` / `ns`, PROTOCOL.md 6.9).
+    private func txtName(of result: NWBrowser.Result) -> (name: String?, source: String?) {
+        if case .bonjour(let txt) = result.metadata { return (txt["n"], txt["ns"]) }
+        return (nil, nil)
     }
 
     /// Same hardware? Strong match: the service's install id equals the id
@@ -621,6 +650,7 @@ final class SenderController: ObservableObject {
         let newlyAttached = Set(devices.map(\.udid)).subtracting(usbDevices.map(\.udid))
         let detached = Set(usbDevices.map(\.udid)).subtracting(devices.map(\.udid))
         usbDevices = devices
+        recordCableNames()
         for udid in detached {
             usbProbes.removeValue(forKey: udid)
             usbProbeAttempted.remove(udid)
@@ -903,6 +933,12 @@ final class SenderController: ObservableObject {
         case .usb(let udid): expectedID = userInitiated ? nil : udid.flatMap { installIDByUDID[$0] }
         case .wifi(let result): expectedID = txtID(of: result)
         }
+        let knownID: String?
+        switch target {
+        case .usb(let udid): knownID = udid.flatMap { installIDByUDID[$0] }
+        case .wifi(let result): knownID = txtID(of: result)
+        }
+        let usbUDID: String? = if case .usb(let udid) = target { udid } else { nil }
         let selectedQuality = DeviceSetupStore.quality(expectedID, fallback: quality)
         let sender = MacSender(transport: transport, name: name, mode: mode,
                                quality: selectedQuality, displaySerial: Self.displaySerial(for: id),
@@ -910,6 +946,21 @@ final class SenderController: ObservableObject {
                                awaitingWake: awaitingWake, expectedPeerID: expectedID)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         session.selectedQuality = selectedQuality
+        let initialName = resolvedName(key: DeviceNameKey.make(installID: knownID, udid: usbUDID),
+                                       live: liveNames(udid: usbUDID, wifi: wifiResult(of: target),
+                                                       endpoint: name),
+                                       kind: nil).name
+        session.displayName = initialName
+        sender.setDisplayName(initialName)
+        // Thread-safe: reads only UserDefaults and these captured values.
+        let liveAtConnect = liveNames(udid: usbUDID, wifi: wifiResult(of: target), endpoint: name)
+        sender.displayNameResolver = { info in
+            let key = DeviceNameKey.make(installID: info.id, udid: usbUDID)
+            var record = DeviceNameStore.load(key) ?? DeviceNameStore.Record()
+            DeviceNameStore.applyReported(info.name, source: info.nameSource,
+                                          kind: info.device, to: &record)
+            return DeviceNaming.resolve(record, live: liveAtConnect, kind: info.device).name
+        }
         lastConnectionGuidance = nil
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
@@ -926,6 +977,7 @@ final class SenderController: ObservableObject {
             let firstHello = session.deviceID == nil
             session.deviceID = info.id
             session.deviceKind = info.device
+            self.recordNames(fromHello: info, session: session)
             if firstHello, userInitiated, case .wifi = target {
                 DeviceSetupStore.update(info.id) { $0.wirelessAllowed = true; $0.reconnectAtLaunch = true }
             }
@@ -1086,6 +1138,130 @@ final class SenderController: ObservableObject {
         sessions.removeAll { $0.id == session.id }
     }
 
+    // MARK: - Device names
+
+    private func wifiResult(of target: ConnectionTarget) -> NWBrowser.Result? {
+        if case .wifi(let result) = target { return result }
+        return nil
+    }
+
+    /// Names seen right now for a device, best first: the cable's Settings
+    /// name, the receiver's advertised name, then the endpoint label.
+    private func liveNames(udid: String?, wifi: NWBrowser.Result?, endpoint: String?) -> [String?] {
+        var names: [String?] = [udid.flatMap { u in usbDevices.first { $0.udid == u }?.name }]
+        if let wifi {
+            let advertised = txtName(of: wifi)
+            if advertised.source != DeviceNameSource.generic.rawValue { names.append(advertised.name) }
+            names.append(serviceName(of: wifi))
+        }
+        names.append(endpoint)
+        return names
+    }
+
+    private func resolvedName(key: String?, live: [String?], kind: String?) -> ResolvedDeviceName {
+        DeviceNaming.resolve(DeviceNameStore.load(key), live: live, kind: kind)
+    }
+
+    private func nameKey(for session: DeviceSession) -> String? {
+        let udid: String? = if case .usb(let u) = session.target { u } else { session.usbUDID }
+        return DeviceNameKey.make(installID: session.deviceID ?? udid.flatMap { installIDByUDID[$0] },
+                                  udid: udid)
+    }
+
+    /// A hello names the device: it is now a remembered, paired device.
+    private func recordNames(fromHello info: PhoneInfo, session: DeviceSession) {
+        guard let key = nameKey(for: session) else { return }
+        let cable = session.onUSB ? session.usbUDID.flatMap { u in usbDevices.first { $0.udid == u }?.name } : nil
+        let changed = DeviceNameStore.update(key) { record in
+            record.kind = DeviceNameText.clean(info.device) ?? record.kind
+            record.lastSeen = Date()
+            if info.nameSource != nil {
+                DeviceNameStore.applyReported(info.name, source: info.nameSource,
+                                              kind: info.device, to: &record)
+            } else if !session.onUSB, let service = session.wifiServiceName {
+                // An older receiver: its service name is all it says.
+                DeviceNameStore.applyReported(service, source: nil, kind: info.device, to: &record)
+            }
+            DeviceNameStore.applyCableName(cable, kind: info.device, to: &record)
+        }
+        if changed { namesChanged() }
+    }
+
+    /// usbmuxd resolved (or re-resolved) a cabled device's Settings name.
+    private func recordCableNames() {
+        defer { refreshSessionNames() }   // live names count even unrecorded
+        var changed = false
+        for device in usbDevices {
+            guard let name = device.name else { continue }
+            let key = DeviceNameKey.make(installID: installIDByUDID[device.udid], udid: device.udid)
+            changed = DeviceNameStore.update(key, createIfMissing: false) { record in
+                DeviceNameStore.applyCableName(name, kind: record.kind, to: &record)
+            } || changed
+        }
+        if changed { nameRevision &+= 1 }
+    }
+
+    /// A remembered device's advertised name changed (renamed in the receiver
+    /// app, or its Settings name became available). Only for devices that
+    /// already have a record; never creates one from a broadcast.
+    private func recordAdvertisedNames() {
+        defer { refreshSessionNames() }
+        var changed = false
+        for result in discovered {
+            let advertised = txtName(of: result)
+            guard advertised.source != nil,
+                  let id = DeviceIdentity.valid(txtID(of: result)) else { continue }
+            changed = DeviceNameStore.update(id, createIfMissing: false) { record in
+                DeviceNameStore.applyReported(advertised.name, source: advertised.source,
+                                              kind: record.kind, to: &record)
+            } || changed
+        }
+        if changed { nameRevision &+= 1 }
+    }
+
+    private func namesChanged() {
+        nameRevision &+= 1
+        refreshSessionNames()
+    }
+
+    /// Push resolved names into live sessions: their rows, status text and
+    /// the sender's own messages. Label only: nothing restarts.
+    func refreshSessionNames() {
+        let entries = deviceEntries
+        for session in sessions {
+            guard let entry = entries.first(where: { self.session(for: $0) === session }) else { continue }
+            let label = entry.detail.map { "\(entry.name) (\($0))" } ?? entry.name
+            guard label != session.displayName else { continue }
+            let old = session.displayName
+            session.displayName = label
+            session.sender.setDisplayName(label)
+            if !old.isEmpty { session.status = session.status.replacingOccurrences(of: old, with: label) }
+        }
+    }
+
+    /// Rename a device on this Mac. Returns false for blank input or a device
+    /// without a stable identity. Never touches the stream or its settings.
+    @discardableResult
+    func rename(_ entry: DeviceEntry, to name: String) -> Bool {
+        guard DeviceNameStore.setCustomName(name, for: entry.nameKey) else { return false }
+        Log.info("renamed \(entry.nameKey ?? "?") on this Mac")
+        namesChanged()
+        return true
+    }
+
+    func resetName(_ entry: DeviceEntry) {
+        DeviceNameStore.resetCustomName(for: entry.nameKey)
+        namesChanged()
+    }
+
+    /// Drop a remembered device from the list (its name only; connection
+    /// settings stay). It reappears the next time it connects.
+    func forget(_ entry: DeviceEntry) {
+        guard entry.remembered, let key = entry.nameKey else { return }
+        DeviceNameStore.remove(key)
+        namesChanged()
+    }
+
     /// Mode/quality apply per-pipeline at construction — rebuild every session.
     func restartAll() {
         guard running else { return }
@@ -1100,23 +1276,42 @@ final class SenderController: ObservableObject {
 
     struct DeviceEntry: Identifiable {
         let id: String
-        let name: String
         let usbTarget: ConnectionTarget?
         let wifiTarget: ConnectionTarget?
+        /// The stable identity the name is stored under; nil = no identity
+        /// yet (Rename unavailable until the device connects once).
+        var nameKey: String? = nil
+        var resolved = ResolvedDeviceName(name: "Device", isCustom: false, automatic: "Device")
+        /// Tells apart devices with the same name ("ID 3F2A", or the kind).
+        var detail: String? = nil
+        var kind: String? = nil
+        /// A device connected before that is not here now.
+        var remembered = false
+        var lastSeen: Date? = nil
+        /// Names seen right now, used when nothing is stored yet.
+        fileprivate var live: [String?] = []
+
+        var name: String { resolved.name }
 
         var transportLabel: String {
             switch (usbTarget != nil, wifiTarget != nil) {
             case (true, true): return "USB · WiFi"
             case (true, false): return "USB"
             case (false, true): return "WiFi"
-            default: return ""
+            default: return remembered ? "Not connected" : ""
             }
         }
         /// Lowest latency first.
         var preferredTarget: ConnectionTarget? { usbTarget ?? wifiTarget }
     }
 
-    var deviceEntries: [DeviceEntry] {
+    /// Nearby and connected devices, one row per physical device.
+    var deviceEntries: [DeviceEntry] { allEntries.filter { !$0.remembered } }
+    /// Devices connected before that are not nearby now.
+    var rememberedEntries: [DeviceEntry] { allEntries.filter(\.remembered) }
+
+    private var allEntries: [DeviceEntry] {
+        _ = nameRevision
         var entries: [DeviceEntry] = []
         var mergedServices = Set<String>()
         var coveredSessionIDs = Set<String>()
@@ -1131,23 +1326,24 @@ final class SenderController: ObservableObject {
             if let twin { coveredSessionIDs.insert(ConnectionTarget.wifi(twin).sessionID) }
             // A WiFi-identity session migrated onto this cable serves the
             // device even when its service is no longer advertised.
-            if let covering = activeSession(coveringUSB: device) {
-                coveredSessionIDs.insert(covering.id)
-            }
-            entries.append(DeviceEntry(
-                id: "device:\(device.udid)",
-                name: device.name
-                    ?? twin.flatMap(serviceName)
-                    ?? session(for: usbTarget.sessionID)?.deviceKind
-                    ?? label(for: usbTarget),
-                usbTarget: usbTarget,
-                wifiTarget: twin.map { .wifi($0) }))
+            let covering = activeSession(coveringUSB: device)
+            if let covering { coveredSessionIDs.insert(covering.id) }
+            let installID = installIDByUDID[device.udid] ?? covering?.deviceID ?? twin.flatMap(txtID)
+            var entry = DeviceEntry(id: "device:\(device.udid)", usbTarget: usbTarget,
+                                    wifiTarget: twin.map { .wifi($0) })
+            entry.nameKey = DeviceNameKey.make(installID: installID, udid: device.udid)
+            entry.kind = covering?.deviceKind ?? session(for: usbTarget.sessionID)?.deviceKind
+            entry.live = liveNames(udid: device.udid, wifi: twin, endpoint: nil)
+                + [label(for: usbTarget)]
+            entries.append(entry)
         }
         if UserDefaults.standard.object(forKey: "host") != nil {
             let target = ConnectionTarget.usb(udid: nil)
             coveredSessionIDs.insert(target.sessionID)
-            entries.append(DeviceEntry(id: target.sessionID, name: label(for: target),
-                                       usbTarget: target, wifiTarget: nil))
+            var entry = DeviceEntry(id: target.sessionID, usbTarget: target, wifiTarget: nil)
+            entry.nameKey = session(for: target.sessionID)?.deviceID.flatMap(DeviceIdentity.valid)
+            entry.live = [label(for: target)]
+            entries.append(entry)
         }
         for result in discovered {
             guard let name = serviceName(of: result), !mergedServices.contains(name)
@@ -1157,18 +1353,55 @@ final class SenderController: ObservableObject {
             // A USB-identity session that failed over to WiFi serves this
             // service — claim it, or it would dangle as a second row and
             // this one would offer a Connect that steals the receiver.
-            if let covering = activeSession(coveringWiFi: result) {
-                coveredSessionIDs.insert(covering.id)
-            }
-            entries.append(DeviceEntry(id: "service:\(name)", name: name,
-                                       usbTarget: nil, wifiTarget: target))
+            let covering = activeSession(coveringWiFi: result)
+            if let covering { coveredSessionIDs.insert(covering.id) }
+            var entry = DeviceEntry(id: "service:\(name)", usbTarget: nil, wifiTarget: target)
+            entry.nameKey = DeviceNameKey.make(installID: txtID(of: result) ?? covering?.deviceID,
+                                               udid: nil)
+            entry.kind = covering?.deviceKind
+            entry.live = liveNames(udid: nil, wifi: result, endpoint: nil)
+            entries.append(entry)
         }
         // Sessions whose device vanished from discovery (e.g. Bonjour record
         // gone while the stream is still alive) keep a row to disconnect.
         for session in sessions where !coveredSessionIDs.contains(session.id) {
-            entries.append(DeviceEntry(id: session.id, name: session.name,
-                                       usbTarget: nil, wifiTarget: nil))
+            var entry = DeviceEntry(id: session.id, usbTarget: nil, wifiTarget: nil)
+            entry.nameKey = nameKey(for: session)
+            entry.kind = session.deviceKind
+            entry.live = [session.name]
+            entries.append(entry)
         }
+        // A device seen under two keys at once (its cable serial before the
+        // install id was learned) must still be one row: keys are unique.
+        var presentKeys = Set<String>()
+        for index in entries.indices {
+            guard let key = entries[index].nameKey else { continue }
+            if !presentKeys.insert(key).inserted { entries[index].nameKey = nil }
+        }
+        let sessionKeys = Set(sessions.compactMap { nameKey(for: $0) })
+        let remembered = storedNameIDs.compactMap { key -> (String, DeviceNameStore.Record)? in
+            guard !presentKeys.contains(key), !sessionKeys.contains(key),
+                  let record = DeviceNameStore.load(key) else { return nil }
+            return (key, record)
+        }.sorted { ($0.1.lastSeen ?? .distantPast) > ($1.1.lastSeen ?? .distantPast) }
+        for (key, record) in remembered {
+            var entry = DeviceEntry(id: "remembered:\(key)", usbTarget: nil, wifiTarget: nil)
+            entry.nameKey = key
+            entry.kind = record.kind
+            entry.remembered = true
+            entry.lastSeen = record.lastSeen
+            entries.append(entry)
+        }
+        for index in entries.indices {
+            let record = DeviceNameStore.load(entries[index].nameKey)
+            entries[index].resolved = DeviceNaming.resolve(record, live: entries[index].live,
+                                                           kind: entries[index].kind)
+            entries[index].kind = record?.kind ?? entries[index].kind
+        }
+        let details = DeviceNaming.distinguishingDetails(entries.map {
+            DeviceNaming.Item(key: $0.nameKey, name: $0.name, kind: $0.kind)
+        })
+        for index in entries.indices { entries[index].detail = details[index] }
         return entries
     }
 
@@ -1400,30 +1633,19 @@ struct ContentView: View {
                 .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .textBackgroundColor)))
             }
             ForEach(controller.deviceEntries) { entry in
-                VStack(alignment: .leading, spacing: 12) {
-                    if let session = controller.session(for: entry) {
-                        SessionRow(title: entry.name, session: session, controller: controller)
-                    } else {
-                        HStack(spacing: 14) {
-                            Image(systemName: "display.2").font(.title2)
-                                .foregroundStyle(DuoMacTheme.accent).frame(width: 40, height: 44)
-                                .background(RoundedRectangle(cornerRadius: 10).fill(DuoMacTheme.accent.opacity(0.08)))
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text(entry.name).font(.headline)
-                                Label(entry.transportLabel, systemImage: entry.usbTarget == nil ? "wifi" : "cable.connector")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if let target = entry.preferredTarget {
-                                Button("Connect") { controller.connect(to: target, userInitiated: true) }
-                                    .buttonStyle(.borderedProminent).controlSize(.large)
-                            }
-                        }
-                    }
+                deviceCard(entry)
+            }
+            if !controller.rememberedEntries.isEmpty {
+                HStack {
+                    Text("Not connected").font(.headline)
+                    Text("\(controller.rememberedEntries.count)")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Spacer()
                 }
-                .padding(18).frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .textBackgroundColor)))
-                .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.primary.opacity(0.06)))
+                .padding(.top, 4)
+                ForEach(controller.rememberedEntries) { entry in
+                    deviceCard(entry)
+                }
             }
             if controller.running {
                 HStack {
@@ -1434,6 +1656,51 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private func deviceCard(_ entry: SenderController.DeviceEntry) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let session = controller.session(for: entry) {
+                SessionRow(entry: entry, session: session, controller: controller)
+            } else {
+                HStack(spacing: 14) {
+                    Image(systemName: DeviceGlyph.symbol(kind: entry.kind)).font(.title2)
+                        .foregroundStyle(entry.remembered ? Color.secondary : DuoMacTheme.accent)
+                        .frame(width: 40, height: 44)
+                        .background(RoundedRectangle(cornerRadius: 10)
+                            .fill((entry.remembered ? Color.secondary : DuoMacTheme.accent).opacity(0.08)))
+                    VStack(alignment: .leading, spacing: 5) {
+                        DeviceTitle(entry: entry).font(.headline)
+                        if entry.remembered {
+                            Text(entry.lastSeen.map { "Not connected · last seen \($0.formatted(.relative(presentation: .named)))" }
+                                 ?? "Not connected")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Label(entry.transportLabel, systemImage: entry.usbTarget == nil ? "wifi" : "cable.connector")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    RenameButton(entry: entry, controller: controller)
+                    if entry.remembered {
+                        Menu {
+                            Button("Remove from List") { controller.forget(entry) }
+                        } label: {
+                            Image(systemName: "ellipsis")
+                        }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                        .help("Removes \(entry.name) and its name from this list. Its connection settings are kept; it reappears when it connects again.")
+                    }
+                    if let target = entry.preferredTarget {
+                        Button("Connect") { controller.connect(to: target, userInitiated: true) }
+                            .buttonStyle(.borderedProminent).controlSize(.large)
+                    }
+                }
+            }
+        }
+        .padding(18).frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .textBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.primary.opacity(0.06)))
     }
 
     private var picturePage: some View {
@@ -1575,7 +1842,7 @@ struct ContentView: View {
 /// One connected device: live status, throughput, reconnect + disconnect.
 @MainActor
 struct SessionRow: View {
-    let title: String
+    let entry: SenderController.DeviceEntry
     @ObservedObject var session: DeviceSession
     let controller: SenderController
     @State private var confirmingShutdown = false
@@ -1608,7 +1875,7 @@ struct SessionRow: View {
                 .fill(statusColor)
                 .frame(width: 9, height: 9)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
+                DeviceTitle(entry: entry)
                 Text("\(session.transportLabel) · \(session.status)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1641,6 +1908,7 @@ struct SessionRow: View {
                 }
             }
             Spacer()
+            RenameButton(entry: entry, controller: controller)
             // A live session recovers on its own (liveness watchdog, redial,
             // transport failover), so only a failed start gets a button.
             if session.failed {
@@ -1655,8 +1923,8 @@ struct SessionRow: View {
                     Image(systemName: "power")
                 }
                 .controlSize(.small)
-                .help("Shut down \(title)")
-                .confirmationDialog("Shut down \(title) now?", isPresented: $confirmingShutdown) {
+                .help("Shut down \(session.displayName)")
+                .confirmationDialog("Shut down \(session.displayName) now?", isPresented: $confirmingShutdown) {
                     Button("Shut Down", role: .destructive) { session.sender.requestPower(.shutdown) }
                 } message: {
                     Text("Apps on it with unsaved changes can still stop the shutdown.")
@@ -1669,7 +1937,7 @@ struct SessionRow: View {
                     Image(systemName: "arrow.up.left.and.arrow.down.right")
                 }
                 .controlSize(.small)
-                .help("Display size of \(title)")
+                .help("Display size of \(session.displayName)")
                 .popover(isPresented: $choosingDisplaySize, arrowEdge: .bottom) {
                     DisplaySizePicker(session: session)
                 }
@@ -1677,6 +1945,123 @@ struct SessionRow: View {
             Button("Disconnect") { controller.disconnect(session) }
                 .controlSize(.small)
         }
+    }
+}
+
+enum DeviceGlyph {
+    static func symbol(kind: String?) -> String {
+        switch kind?.lowercased() {
+        case "ipad"?: return "ipad"
+        case "mac"?: return "laptopcomputer"
+        case "iphone"?: return "iphone"
+        default: return "display.2"
+        }
+    }
+}
+
+/// A device's name, one line, with the distinguishing detail when another
+/// device shares the name. The full name is in the tooltip when truncated.
+struct DeviceTitle: View {
+    let entry: SenderController.DeviceEntry
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(entry.name).lineLimit(1).truncationMode(.middle)
+                .layoutPriority(1)
+            if let detail = entry.detail {
+                Text(detail).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .lineLimit(1).fixedSize()
+            }
+        }
+        .help(entry.resolved.isCustom && entry.resolved.automatic != entry.name
+              ? "\(entry.name) — automatic name: \(entry.resolved.automatic)" : entry.name)
+    }
+}
+
+/// The Rename control on every device row. Renaming is a label on this Mac:
+/// it never restarts a stream, changes pairing or touches device settings.
+struct RenameButton: View {
+    let entry: SenderController.DeviceEntry
+    let controller: SenderController
+    @State private var editing = false
+
+    var body: some View {
+        Button {
+            editing = true
+        } label: {
+            Image(systemName: "pencil")
+        }
+        .controlSize(.small)
+        .disabled(entry.nameKey == nil)
+        .help(entry.nameKey == nil
+              ? "Connect this device once to rename it. It hasn’t shared a stable identity yet."
+              : "Rename \(entry.name)")
+        .accessibilityLabel("Rename \(entry.name)")
+        .popover(isPresented: $editing, arrowEdge: .bottom) {
+            DeviceNameEditor(entry: entry, controller: controller) { editing = false }
+        }
+    }
+}
+
+struct DeviceNameEditor: View {
+    let entry: SenderController.DeviceEntry
+    let controller: SenderController
+    let dismiss: () -> Void
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    private var cleaned: String? { DeviceNameText.clean(text) }
+    private var canSave: Bool { cleaned != nil && cleaned != entry.name }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Rename Device").font(.headline)
+            TextField("Name", text: $text, prompt: Text(entry.resolved.automatic))
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 260)
+                .focused($focused)
+                .onSubmit { save() }
+                .onChange(of: text) {
+                    if text.count > DeviceNameText.maxCharacters {
+                        text = String(text.prefix(DeviceNameText.maxCharacters))
+                    }
+                }
+            Group {
+                if cleaned == nil {
+                    Text("Enter a name, or reset to the automatic name.")
+                } else {
+                    Text("Automatic name: \(entry.resolved.automatic)")
+                }
+            }
+            .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            .frame(width: 260, alignment: .leading)
+            HStack {
+                if entry.resolved.isCustom {
+                    Button("Reset to Automatic") {
+                        controller.resetName(entry)
+                        dismiss()
+                    }
+                    .help("Use \(entry.resolved.automatic)")
+                }
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { save() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canSave)
+            }
+            .controlSize(.small)
+        }
+        .padding(14)
+        .onAppear {
+            text = entry.name
+            focused = true
+        }
+    }
+
+    private func save() {
+        guard canSave, let cleaned else { return }
+        if controller.rename(entry, to: cleaned) { dismiss() }
     }
 }
 

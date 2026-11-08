@@ -110,6 +110,9 @@ final class StreamReceiver: ObservableObject {
     /// keeps its last frame, dims it and says "Switching to …" (see
     /// `TransportSwitchTracker`). Main thread.
     @Published private(set) var transportSwitch: TransportSwitchTracker.Target?
+    /// The active connection as every surface shows it (stats, Settings, the
+    /// centered notice). Driven by the socket actually streaming. Main thread.
+    @Published private(set) var link = ConnectionStatus()
 
     /// True when the connected Mac understands pencil/proximity wire messages.
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
@@ -118,7 +121,7 @@ final class StreamReceiver: ObservableObject {
     // receive queue reads `switchHolding` (under the lock) to decide whether a
     // new connection may keep the last frame on screen, and counts frames per
     // connection to know a link had really been streaming.
-    private var switchTracker = TransportSwitchTracker()
+    private var indicator = ConnectionIndicator()
     private var switchWake: DispatchWorkItem?
     private let switchLock = NSLock()
     private var switchHoldingFlag = false
@@ -288,7 +291,18 @@ final class StreamReceiver: ObservableObject {
     // needs an entitlement Apple gates behind approval and personal teams
     // can't get), so this is user-editable in Settings. The USB picker gets
     // the real name host-side via lockdownd regardless.
-    var serviceName = "Duo Display"
+    var serviceName = "Duo Display" {
+        didSet {
+            let fitted = DeviceNameText.truncated(serviceName, maxBytes: DeviceNameText.maxServiceNameBytes)
+            if fitted != serviceName { serviceName = fitted }
+        }
+    }
+    /// Where `serviceName` came from (`DeviceNameSource`), announced as
+    /// `hello.nameSource` and TXT `ns` (PROTOCOL.md 6.9). nil announces no
+    /// name at all, which is what an older receiver looks like.
+    var nameSource: String?
+    /// The full name before Bonjour's 63-byte cap.
+    private var announcedName: String?
 
     // Platform identity, injected at init so this file stays UI-framework-free.
     /// "iPhone" / "iPad" / "Mac" — announced in the hello (the sender names
@@ -329,16 +343,35 @@ final class StreamReceiver: ObservableObject {
         var txt = NWTXTRecord()
         txt["id"] = Self.installID
         txt["pv"] = String(WireProtocol.version)   // issue #132
+        if let nameSource {
+            txt["n"] = DeviceNameText.truncated(announcedName ?? serviceName,
+                                                maxBytes: DeviceNameText.maxTXTBytes)
+            txt["ns"] = nameSource
+        }
         return NWListener.Service(name: serviceName, type: "_opensidecar._tcp",
                                   domain: nil, txtRecord: txt)
     }
 
     /// Update the advertised name and re-publish if already listening.
-    func setServiceName(_ name: String) {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolved = trimmed.isEmpty ? fallbackServiceName : trimmed
+    /// Set the announced name before `start()`.
+    func setInitialName(_ name: String, source: String?) {
+        let resolved = DeviceNameText.clean(name) ?? fallbackServiceName
+        announcedName = resolved
+        nameSource = source
+        serviceName = resolved
+    }
+
+    /// `source` (a `DeviceNameSource` raw value) is announced alongside it;
+    /// nil keeps the current one. A name change rides the TXT record only: a
+    /// re-sent hello would make the sender re-plan the display mid-stream.
+    func setServiceName(_ name: String, source: String? = nil) {
+        let resolved = DeviceNameText.clean(name) ?? fallbackServiceName
         queue.async {
-            guard resolved != self.serviceName else { return }
+            let newSource = source ?? self.nameSource
+            guard resolved != (self.announcedName ?? self.serviceName)
+                    || newSource != self.nameSource else { return }
+            self.announcedName = resolved
+            self.nameSource = newSource
             self.serviceName = resolved
             if self.listener != nil {
                 self.listener?.service = self.advertisedService
@@ -420,7 +453,17 @@ final class StreamReceiver: ObservableObject {
         displayLayer.videoGravity = .resizeAspect
     }
 
+    #if DEBUG
+    /// Set by the simulator UI harness: no listener, no Bonjour, so a real
+    /// Mac can never connect to a harness run.
+    private(set) var debugOffline = false
+    func debugGoOffline() { debugOffline = true }
+    #endif
+
     func start(port: UInt16 = 9000) {
+        #if DEBUG
+        if debugOffline { return }
+        #endif
         self.port = port
         queue.async {
             self.startListener()
@@ -449,6 +492,9 @@ final class StreamReceiver: ObservableObject {
     /// returns to the foreground (iOS may have torn it down while suspended,
     /// or enterSleep deliberately took it down on lock).
     func ensureListening() {
+        #if DEBUG
+        if debugOffline { return }
+        #endif
         queue.async {
             guard !self.listenerHealthy else { return }
             Log.info("listener not healthy — restarting")
@@ -645,6 +691,9 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func startListener() {
+        #if DEBUG
+        if debugOffline { return }   // harness: never reachable by a real Mac
+        #endif
         do {
             // noDelay matters most in THIS direction: touch events are tiny
             // packets, and Nagle would hold each one until the previous is
@@ -754,6 +803,9 @@ final class StreamReceiver: ObservableObject {
     private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
         if greeted { Log.info("newcomer proved itself — adopting it as the session") }
         transport = DirectCable.isLoopback(conn.endpoint) ? "USB" : "WiFi"
+        // Loopback is certain (usbmuxd). A network socket's interface is only
+        // known once it is ready (onReady), so it is not labelled before.
+        let adoptedTransport: StreamTransport? = transport == "USB" ? .usb : nil
         connection?.cancel()
         connection = conn
         // The race is decided: rival candidates die here.
@@ -770,7 +822,7 @@ final class StreamReceiver: ObservableObject {
         // under the dim until the new link's first frame replaces it.
         resetStreamState(keepLastImage: switchHolding)
         framesOnConnection = 0
-        updateSwitch { tracker, _ in tracker.connectionAdopted() }
+        updateSwitch { indicator, now in indicator.linkAdopted(adoptedTransport, now: now) }
         lastCursorSeq = 0   // the sender restarts its cursor sequence per session
         cursorPortAnnounced = false
         // Hide the previous sender's cursor: replayed into a fresh video view
@@ -789,6 +841,8 @@ final class StreamReceiver: ObservableObject {
             if self.transport != "USB", let path = conn.currentPath {
                 self.transport = path.usesInterfaceType(.wifi) ? "WiFi" : "Cable"
             }
+            let ready = StreamTransport(receiverLabel: self.transport)
+            self.updateSwitch { indicator, now in indicator.linkReady(ready, now: now) }
             self.setConnected(true)
             self.sendHello(on: conn)
         }
@@ -957,13 +1011,13 @@ final class StreamReceiver: ObservableObject {
             // so until the new link streams (PROTOCOL.md 6.8).
             if let target = (obj["to"] as? String).flatMap(TransportSwitchTracker.Target.init(rawValue:)) {
                 Log.info("Mac is switching this session to \(target.rawValue)")
-                updateSwitch { tracker, now in tracker.announced(to: target, now: now) }
+                updateSwitch { indicator, now in indicator.announced(target, now: now) }
             }
         case WireMessage.sessionEnd:
             // Deliberate end (Disconnect, quit, restart): the close that
             // follows is not an unplug, so no "switching" overlay.
             Log.info("Mac ended the session")
-            updateSwitch { tracker, _ in tracker.sessionEnded() }
+            updateSwitch { indicator, now in indicator.sessionEnded(now: now) }
         case WireMessage.updateRequired:
             // The Mac refuses this pairing until we update from the App Store.
             let message = obj["message"] as? String
@@ -1040,6 +1094,10 @@ final class StreamReceiver: ObservableObject {
         let panel = panelOverride ?? PanelAnnouncement(
             pixelsWide: devicePixelsWide, pixelsHigh: devicePixelsHigh, scale: deviceScale)
         hello["panel"] = panel.json
+        if let nameSource {   // PROTOCOL.md 6.9
+            hello["name"] = announcedName ?? serviceName
+            hello["nameSource"] = nameSource
+        }
         // Additive joint capability. The legacy rectangle below stays on the
         // wire while independently updated senders remain in the field.
         var h264: [String: Any] = ["codec": "h264", "maxFrameRate": 60]
@@ -1400,7 +1458,7 @@ final class StreamReceiver: ObservableObject {
         if renderingPaused { return }
         framesOnConnection += 1
         if framesOnConnection == 1 {
-            updateSwitch { tracker, now in tracker.streamResumed(now: now) }
+            updateSwitch { indicator, now in indicator.firstFrame(now: now) }
         }
 
         // Build one AVCC buffer: each NALU prefixed with 4-byte big-endian length.
@@ -1723,17 +1781,17 @@ final class StreamReceiver: ObservableObject {
 
     /// Run `change` on the main thread against the switch tracker, then
     /// publish whatever it decided and schedule the next expiry check.
-    private func updateSwitch(_ change: @escaping (inout TransportSwitchTracker, Date) -> Void) {
+    private func updateSwitch(_ change: @escaping (inout ConnectionIndicator, Date) -> Void) {
         DispatchQueue.main.async {
             let now = Date()
-            change(&self.switchTracker, now)
+            change(&self.indicator, now)
             self.publishSwitch(now: now)
         }
     }
 
     private func publishSwitch(now: Date) {
-        switchTracker.tick(now: now)
-        let target = switchTracker.target
+        indicator.tick(now: now)
+        let target = indicator.tracker.target
         switchLock.lock()
         switchHoldingFlag = target != nil
         switchLock.unlock()
@@ -1741,27 +1799,73 @@ final class StreamReceiver: ObservableObject {
             Log.info("transport switch overlay: \(target?.label ?? "off")")
             transportSwitch = target
         }
+        let status = ConnectionStatus(phase: indicator.phase, notice: indicator.notice)
+        if status != link {
+            if status.phase != link.phase { Log.info("connection: \(status.phase.fullLabel)") }
+            link = status
+        }
         switchWake?.cancel()
         switchWake = nil
-        if let wait = switchTracker.nextWake(now: now) {
+        if let wait = indicator.nextWake(now: now) {
             let work = DispatchWorkItem { [weak self] in self?.publishSwitch(now: Date()) }
             switchWake = work
             DispatchQueue.main.asyncAfter(deadline: .now() + wait, execute: work)
         }
     }
 
+    #if DEBUG
+    /// Simulator UI harness (DEBUG builds only): drives the real
+    /// `ConnectionIndicator` through a scripted event sequence with no
+    /// sockets, so the stats, Settings and notice can be inspected. It
+    /// proves the UI follows the indicator, not that real USB/Wi-Fi does.
+    /// `steps` stops the script after that many events to freeze a state.
+    func debugRunLinkScenario(_ name: String, steps: Int?, panel: CGSize) {
+        enum Step { case adopt(StreamTransport?), ready(StreamTransport), frame, lost, announce(TransportSwitchTracker.Target) }
+        let usb: [(Double, Step)] = [(0, .adopt(.usb)), (0, .ready(.usb)), (0.1, .frame)]
+        let wifi: [(Double, Step)] = [(0, .adopt(nil)), (0, .ready(.wifi)), (0.1, .frame)]
+        let script: [(Double, Step)]
+        switch name {
+        case "usb": script = usb
+        case "wifi": script = wifi
+        case "unplug": script = usb + [(2, .lost), (4, .adopt(nil)), (4, .ready(.wifi)), (6, .frame)]
+        case "plugin": script = wifi + [(2, .announce(.usb)), (2.3, .lost), (4, .adopt(.usb)), (4, .ready(.usb)), (5, .frame)]
+        case "nowifi": script = usb + [(2, .lost)]
+        case "usbfail": script = wifi + [(2, .announce(.usb)), (2.3, .lost), (7, .adopt(nil)), (7, .ready(.wifi)), (8, .frame)]
+        default: return
+        }
+        debugOffline = true
+        let limited = steps.map { Array(script.prefix($0)) } ?? script
+        Log.info("DEBUG link scenario \(name), \(limited.count) steps")
+        DispatchQueue.main.async {
+            self.videoSize = panel
+            self.perf.codec = "HEVC"
+        }
+        for (delay, step) in limited {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                let now = Date()
+                switch step {
+                case .adopt(let t): self.indicator.linkAdopted(t, now: now)
+                case .ready(let t): self.indicator.linkReady(t, now: now); self.connected = true
+                case .frame: self.indicator.firstFrame(now: now)
+                case .lost:
+                    self.indicator.linkLost(hadFrames: true, deliberate: false, now: now)
+                    self.connected = false
+                case .announce(let target): self.indicator.announced(target, now: now)
+                }
+                self.publishSwitch(now: now)
+                if case .ready(let t) = step { self.perf.transport = t == .usb ? "USB" : "WiFi" }
+            }
+        }
+    }
+    #endif
+
     /// `deliberate` marks a close this side chose (sleep, quit): never an unplug.
     private func setConnected(_ value: Bool, deliberate: Bool = false) {
         if !value {
-            let lastTransport = transport
             let hadFrames = framesOnConnection > 0
             framesOnConnection = 0
-            if deliberate {
-                updateSwitch { tracker, _ in tracker.clear() }
-            } else {
-                updateSwitch { tracker, now in
-                    tracker.linkLost(lastTransport: lastTransport, hadFrames: hadFrames, now: now)
-                }
+            updateSwitch { indicator, now in
+                indicator.linkLost(hadFrames: hadFrames, deliberate: deliberate, now: now)
             }
         }
         DispatchQueue.main.async {

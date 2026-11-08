@@ -67,7 +67,13 @@ final class ReceiverController: ObservableObject {
                                                           maxHeight: $0.height, maxFrameRate: 60)
                                       })
         let saved = UserDefaults.standard.string(forKey: "receiverName")
-        receiver.serviceName = (saved?.isEmpty == false) ? saved! : fallbackName
+        // A Mac's computer name is public, so it is a real device name; one
+        // typed into the panel is the app's own (PROTOCOL.md 6.9).
+        if let saved = DeviceNameText.clean(saved) {
+            receiver.setInitialName(saved, source: DeviceNameSource.app.rawValue)
+        } else {
+            receiver.setInitialName(fallbackName, source: Self.nameSource(for: fallbackName))
+        }
         announcePanel(to: receiver)
         receiver.powerActions = PowerControl.supported
         receiver.onPowerAction = { [weak self] action in self?.perform(action) }
@@ -174,7 +180,16 @@ final class ReceiverController: ObservableObject {
     /// computer name (mirrors the iOS Settings behavior).
     func setAdvertisedName(_ name: String) {
         UserDefaults.standard.set(name, forKey: "receiverName")
-        receiver?.setServiceName(name)
+        if DeviceNameText.clean(name) != nil {
+            receiver?.setServiceName(name, source: DeviceNameSource.app.rawValue)
+        } else {
+            receiver?.setServiceName(fallbackName, source: Self.nameSource(for: fallbackName))
+        }
+    }
+
+    private static func nameSource(for computerName: String) -> String {
+        (DeviceNameText.isGeneric(computerName, kind: "Mac")
+            ? DeviceNameSource.generic : .device).rawValue
     }
 
     /// The panel this Mac offers as a display: the primary screen's current
@@ -540,7 +555,7 @@ struct ReceiverPerfOverlay: View {
         if showAnalytics {
             VStack {
                 Spacer()
-                PerfOverlay(stats: receiver.perf, videoSize: receiver.videoSize)
+                PerfOverlay(stats: receiver.perf, videoSize: receiver.videoSize, phase: receiver.link.phase)
                     .padding(.bottom, 10)
             }
             .allowsHitTesting(false)

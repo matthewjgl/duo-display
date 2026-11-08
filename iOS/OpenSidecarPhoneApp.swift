@@ -7,6 +7,28 @@ import Combine
 /// "iPad" or "iPhone" — so UI copy names the device the user is holding.
 let deviceKind = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
 
+/// The name this device announces to the Mac. iOS 16+ only shares the
+/// user-assigned name (Settings > General > About > Name) with apps that hold
+/// Apple's user-assigned-device-name entitlement; without it
+/// `UIDevice.current.name` is just the model. That is detected, never assumed:
+/// a generic name is announced as such and the Mac uses its own sources (the
+/// cable's lockdown name, or a name set on the Mac).
+enum PhoneName {
+    /// The name typed into this app's settings ("" = automatic).
+    static var appName: String { UserDefaults.standard.string(forKey: "deviceName") ?? "" }
+
+    static func current(appName: String = PhoneName.appName) -> (name: String, source: DeviceNameSource) {
+        DeviceNameAnnouncement.choose(appName: appName, systemName: UIDevice.current.name,
+                                      model: UIDevice.current.model)
+    }
+
+    /// The system name, when iOS shares a personalized one with this app.
+    static var personalizedSystemName: String? {
+        let name = DeviceNameText.clean(UIDevice.current.name)
+        return DeviceNameText.isGeneric(name, kind: UIDevice.current.model) ? nil : name
+    }
+}
+
 /// Landing page — hosts the Mac app download and explains the two-app setup.
 let macAppURL = URL(string: "https://myduodisplay.com/download")!
 
@@ -118,10 +140,10 @@ struct ReceiverScreen: View {
                         HStack {
                             Spacer()
                             LatencyHUD(live: model.receiver.live,
-                                       transport: model.receiver.perf.transport,
+                                       phase: model.receiver.link.phase,
                                        codec: model.receiver.perf.codec)
                                 .onTapGesture { showLatencyHUD = false }
-                                .accessibilityLabel("Latency HUD. Tap to hide.")
+                                .accessibilityHint("Tap to hide.")
                         }
                         .padding(.trailing, 14)
                         .padding(.bottom, 14)
@@ -129,19 +151,22 @@ struct ReceiverScreen: View {
                     }
                     // Sidecar-style mode transition: the last frame, dimmed (not
                     // hidden), with a centered label while the link changes.
+                    // The words are the centered notice below, shared with
+                    // the idle screen; this layer only dims.
                     ZStack {
-                        if let target = model.receiver.transportSwitch {
-                            TransportSwitchOverlay(target: target)
+                        if model.receiver.link.phase.isInTransition {
+                            TransportSwitchOverlay()
                                 .transition(.opacity)
                         }
                     }
-                    .animation(.easeInOut(duration: 0.25), value: model.receiver.transportSwitch)
+                    .animation(.easeInOut(duration: 0.25), value: model.receiver.link.phase.isInTransition)
                     .allowsHitTesting(false)
                     if showAnalytics {
                         VStack {
                             Spacer()
                             PerfOverlay(stats: model.receiver.perf,
-                                        videoSize: model.receiver.videoSize)
+                                        videoSize: model.receiver.videoSize,
+                                        phase: model.receiver.link.phase)
                                 .padding(.bottom, 10)
                         }
                         .allowsHitTesting(false)   // never block touch input
@@ -149,6 +174,9 @@ struct ReceiverScreen: View {
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
+                // Brief, centered transport notice. Shown whatever the stats
+                // setting; never takes touches.
+                ConnectionNoticeView(notice: model.receiver.link.notice)
             }
             // The window, not this view: a sheet, the keyboard or the
             // hidden status bar change the view's frame but not the panel.
@@ -192,7 +220,10 @@ struct ReceiverScreen: View {
         .onChange(of: scenePhase) { phase in
             Log.info("scenePhase -> \(String(describing: phase))")
             switch phase {
-            case .active: model.sceneDidActivate()
+            case .active:
+                model.sceneDidActivate()
+                // The user may have renamed the device in Settings meanwhile.
+                model.refreshAnnouncedName()
             case .background: model.sceneDidBackground()
             default: break
             }
@@ -243,29 +274,68 @@ struct ReceiverScreen: View {
 /// "Switching to Wi-Fi · wireless mode" / "Switching to USB mode": the stream's
 /// last frame stays visible underneath, dimmed to about 40% black.
 struct TransportSwitchOverlay: View {
-    let target: TransportSwitchTracker.Target
-
     /// How much black goes over the last frame (0.35 to 0.45 reads as
     /// "still there, paused", not "gone").
     static let dim = 0.4
 
     var body: some View {
+        Color.black.opacity(Self.dim).ignoresSafeArea()
+            .accessibilityHidden(true)
+    }
+}
+
+/// Sidecar-style status feedback: one small centered capsule that morphs in
+/// place (never stacks) and fades. VoiceOver hears each new notice once.
+struct ConnectionNoticeView: View {
+    let notice: TransitionNotice?
+
+    var body: some View {
         ZStack {
-            Color.black.opacity(Self.dim).ignoresSafeArea()
-            HStack(spacing: 10) {
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .tint(.white)
-                Text(target.label)
-                    .font(.system(size: 17, weight: .medium))
-                    .foregroundColor(.white)
+            if let notice {
+                VStack(spacing: 6) {
+                    HStack(spacing: 10) {
+                        if notice.kind == .progress {
+                            ProgressView().progressViewStyle(.circular).tint(.white)
+                        }
+                        Image(systemName: notice.symbol)
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundColor(notice.kind == .failure ? .orange : .white)
+                        Text(notice.title)
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                    }
+                    if let detail = notice.detail {
+                        Text(detail)
+                            .font(.footnote)
+                            .foregroundColor(.white.opacity(0.8))
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
+                .frame(maxWidth: 360)
+                // Opaque enough to read over the idle screen's cards as well
+                // as over video; the hairline separates it from dark UI.
+                .background(RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color(white: 0.09))
+                    .shadow(color: .black.opacity(0.35), radius: 16, y: 6))
+                .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5))
+                .padding(24)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(notice.accessibilityLabel)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
-            .background(Capsule().fill(Color.black.opacity(0.35)))
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(target.label)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeInOut(duration: 0.25), value: notice)
+        .allowsHitTesting(false)
+        .onChange(of: notice) { notice in
+            guard let notice else { return }
+            UIAccessibility.post(notification: .announcement, argument: notice.accessibilityLabel)
+        }
     }
 }
 
@@ -275,7 +345,7 @@ struct IdleView: View {
     @ObservedObject var receiver: StreamReceiver
     @Binding var showSettings: Bool
     @State private var connectionHelp = 0
-    @AppStorage("deviceName") private var deviceName = UIDevice.current.name
+    @AppStorage("deviceName") private var deviceName = ""
     @ScaledMetric(relativeTo: .largeTitle) private var titleSize = 30.0
 
     private var needsAttention: Bool { receiver.status.localizedCaseInsensitiveContains("fail") }
@@ -362,7 +432,7 @@ struct IdleView: View {
                     Image(systemName: deviceKind == "iPad" ? "ipad" : "iphone").foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Look for this device").font(.caption).foregroundStyle(.secondary)
-                        Text(deviceName).font(.subheadline.weight(.semibold)).lineLimit(2)
+                        Text(PhoneName.current(appName: deviceName).name).font(.subheadline.weight(.semibold)).lineLimit(2)
                     }
                     Spacer(minLength: 0)
                 }
@@ -556,25 +626,41 @@ struct SettingsView: View {
             Form {
                 Section {
                     HStack(spacing: 12) {
-                        Image(systemName: receiver.connected ? "link" : "antenna.radiowaves.left.and.right")
-                            .font(.title3).foregroundStyle(receiver.connected ? Color.green : DuoPhoneTheme.accent)
+                        Image(systemName: receiver.link.phase.symbol)
+                            .font(.title3)
+                            .foregroundStyle(receiver.link.phase.isStreaming ? Color.green
+                                             : receiver.link.phase.isInTransition ? Color.orange
+                                             : DuoPhoneTheme.accent)
                             .frame(width: 28)
                         VStack(alignment: .leading, spacing: 5) {
-                            Text(receiver.connected ? "Connected to your Mac" : "Waiting for your Mac")
+                            Text(receiver.link.phase.settingsTitle)
                                 .font(.headline)
+                            if receiver.link.phase != .disconnected {
+                                Text(receiver.link.phase.fullLabel)
+                                    .font(.subheadline.weight(.medium))
+                            }
                             Text(receiver.status).font(.footnote).foregroundStyle(.secondary)
                         }
-                    }.padding(.vertical, 4)
+                    }
+                    .padding(.vertical, 4)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(receiver.link.phase.accessibilityLabel)
+                    .accessibilityValue(receiver.status)
                     if receiver.connected && receiver.videoSize != .zero {
                         LabeledRow("Resolution", value: "\(Int(receiver.videoSize.width)) × \(Int(receiver.videoSize.height))")
                         LabeledRow("Frame rate", value: "\(receiver.fps) FPS")
                     }
                     HStack {
                         Text("Device name")
-                        DeviceNameField { receiver.setServiceName($0) }.multilineTextAlignment(.trailing)
+                        DeviceNameField { name in
+                            let announced = PhoneName.current(appName: name)
+                            receiver.setServiceName(announced.name, source: announced.source.rawValue)
+                        }.multilineTextAlignment(.trailing)
                     }
                 } header: { Text("Connection") } footer: {
-                    Text("Your Mac finds this name in Duo Display’s device list.")
+                    Text(PhoneName.personalizedSystemName == nil
+                         ? "Your Mac shows this name in its device list. iOS doesn’t share this \(deviceKind)’s name from Settings with apps, so leave it blank to have your Mac use the name it reads over USB, or rename the device on your Mac."
+                         : "Your Mac shows this name in its device list. Leave it blank to use this \(deviceKind)’s name from Settings.")
                 }
 
                 Section {
@@ -796,12 +882,13 @@ extension View {
 /// The device-name editor, deliberately kept out of any high-frequency
 /// @ObservedObject so streaming updates can't rebuild it and steal focus.
 private struct DeviceNameField: View {
-    @AppStorage("deviceName") private var deviceName = UIDevice.current.name
+    @AppStorage("deviceName") private var deviceName = ""
     @FocusState private var focused: Bool
     let onChange: (String) -> Void
 
     var body: some View {
-        TextField("Device name", text: $deviceName)
+        TextField("Device name", text: $deviceName,
+                  prompt: Text(PhoneName.personalizedSystemName ?? "Automatic"))
             .textInputAutocapitalization(.words)
             .autocorrectionDisabled()
             .focused($focused)
@@ -842,12 +929,37 @@ final class ReceiverModel: ObservableObject {
         if let budget = DecodeBudget.maxPixelsPerSecond(model: DecodeBudget.currentModel) {
             receiver.setDecodeBudget(maxPixelsPerSecond: budget)
         }
-        let savedName = UserDefaults.standard.string(forKey: "deviceName")
-        receiver.serviceName = (savedName?.isEmpty == false) ? savedName! : UIDevice.current.name
+        let announced = PhoneName.current()
+        receiver.setInitialName(announced.name, source: announced.source.rawValue)
+        #if DEBUG
+        // Simulator UI harness: offline before anything can start a listener.
+        if UserDefaults.standard.string(forKey: "DuoPreviewLink") != nil { receiver.debugGoOffline() }
+        #endif
         receiver.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
+    }
+
+    #if DEBUG
+    /// `-DuoPreviewLink usb|wifi|unplug|plugin|nowifi|usbfail` (optionally
+    /// `-DuoPreviewSteps N`) runs the simulator UI harness instead of
+    /// listening. DEBUG builds only.
+    func runPreviewScenarioIfRequested() -> Bool {
+        guard let name = UserDefaults.standard.string(forKey: "DuoPreviewLink") else { return false }
+        // Launch arguments arrive as strings; integer(forKey:) parses them.
+        let rawSteps = UserDefaults.standard.integer(forKey: "DuoPreviewSteps")
+        let steps: Int? = rawSteps > 0 ? rawSteps : nil
+        let native = UIScreen.main.bounds.size
+        receiver.debugRunLinkScenario(name, steps: steps, panel: native)
+        return true
+    }
+    #endif
+
+    /// Re-announce the name if the Settings name became available or changed.
+    func refreshAnnouncedName() {
+        let announced = PhoneName.current()
+        receiver.setServiceName(announced.name, source: announced.source.rawValue)
     }
 
     /// The window this app renders into, kept to re-read on activation.
@@ -898,6 +1010,9 @@ final class ReceiverModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        #if DEBUG
+        if runPreviewScenarioIfRequested() { return }   // harness: no listener
+        #endif
         receiver.start(port: 9000)
     }
 

@@ -158,12 +158,15 @@ targets:
       - Mac/AndroidUSBFunction.swift
       - Mac/TransportFailover.swift
       - Mac/DeviceSetup.swift
+      - Mac/DeviceNames.swift
+      - Shared/DeviceName.swift
       - Mac/USBPeerProbe.swift
       - Mac/Usbmux.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift
       - Shared/TransportSwitch.swift
+      - Shared/ConnectionIndicator.swift
       - Shared/ConnectionHealth.swift
       - Shared/ReceiverOrientation.swift
       - Shared/DirectCable.swift

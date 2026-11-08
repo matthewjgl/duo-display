@@ -82,7 +82,23 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // The dial target. Written on `queue` only (after init): the controller
     // can migrate a live session between transports via switchTransport.
     private var transport: SenderTransport
-    private let endpointName: String
+    /// The device's resolved name, for status text and the virtual display.
+    /// Renaming updates it without touching the stream (`setDisplayName`);
+    /// the virtual display takes the name current when it is created.
+    private let nameLock = NSLock()
+    private var currentEndpointName: String
+    private var endpointName: String {
+        nameLock.lock(); defer { nameLock.unlock() }
+        return currentEndpointName
+    }
+    /// Resolves the device's name from its hello (thread-safe; called on the
+    /// sender queue right before the virtual display is created).
+    var displayNameResolver: (@Sendable (PhoneInfo) -> String?)?
+
+    func setDisplayName(_ name: String) {
+        nameLock.lock(); defer { nameLock.unlock() }
+        currentEndpointName = name
+    }
     private let mode: CaptureMode
     private var selectedQuality: StreamQuality
     private var quality: StreamQuality {
@@ -409,7 +425,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
          quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
          identityOffset: UInt32 = 0, awaitingWake: Bool = false, expectedPeerID: String? = nil) {
         self.transport = transport
-        self.endpointName = name
+        self.currentEndpointName = name
         self.mode = mode
         self.selectedQuality = quality
         self.peerIdentity = PeerIdentityGate(expected: expectedPeerID)
@@ -749,6 +765,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         // USB sessions can start before lockdown resolves the device name —
         // fall back to the kind from the hello rather than the generic label.
+        if let resolved = displayNameResolver?(info) { setDisplayName(resolved) }
         let displayName = endpointName.hasPrefix("iPhone / iPad")
             ? "Duo Display — \(info.kind)"
             : "Duo Display — \(endpointName)"

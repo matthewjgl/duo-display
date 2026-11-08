@@ -23,6 +23,8 @@ struct PhoneInfo: Decodable {
                           // (PROTOCOL.md 6.6); absent = none offered
     let panel: PanelInfo? // the receiver's panel facts (PROTOCOL.md 6.7);
                           // absent on older receivers → legacy facts
+    let name: String?       // the receiver's announced name (PROTOCOL.md 6.9);
+    let nameSource: String? //  absent on older receivers
 
     var kind: String { device ?? "device" }
     var protocolVersion: Int { pv ?? WireProtocol.assumedWhenAbsent }

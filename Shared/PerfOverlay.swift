@@ -10,6 +10,9 @@ import SwiftUI
 struct PerfOverlay: View {
     let stats: PerfStats
     let videoSize: CGSize
+    /// The active connection (StreamReceiver.link), the same value the
+    /// Compact HUD and Settings show.
+    let phase: ConnectionPhase
 
     var body: some View {
         VStack(spacing: 8) {
@@ -17,16 +20,7 @@ struct PerfOverlay: View {
             // portrait iPhone is ~390pt, far less than one full row.
             MetricsRow {
                 // Transport badge — the question "is this cable or WiFi?"
-                Text(stats.transport)
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(stats.transport == "USB" || stats.transport == "Cable"
-                                    ? Color.green.opacity(0.35)
-                                : stats.transport == "WiFi" ? Color.blue.opacity(0.4)
-                                : Color.gray.opacity(0.3),
-                                in: Capsule())
-                    .foregroundStyle(.white)
+                TransportBadge(phase: phase, full: true)
                 if !stats.codec.isEmpty {
                     Text(stats.codec)
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
@@ -137,12 +131,45 @@ struct PerfOverlay: View {
 
 // MARK: - Corner latency + FPS HUD
 
+/// The active transport, icon + label, as a capsule. `full` picks the longer
+/// label (Detailed stats); Compact uses the short one.
+struct TransportBadge: View {
+    let phase: ConnectionPhase
+    var full = false
+
+    private var tint: Color {
+        switch phase {
+        case .streaming(.wifi): return Color.blue.opacity(0.4)
+        case .streaming: return Color.green.opacity(0.35)
+        case .switching, .reconnecting, .connecting: return Color.orange.opacity(0.4)
+        case .disconnected: return Color.gray.opacity(0.3)
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: phase.symbol)
+                .font(.system(size: full ? 11 : 9, weight: .bold))
+            Text(full ? phase.fullLabel : phase.shortLabel)
+                .font(.system(size: full ? 12 : 9, weight: .bold, design: .monospaced))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, full ? 8 : 6)
+        .padding(.vertical, full ? 3 : 2)
+        .background(tint, in: Capsule())
+        .foregroundStyle(.white)
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(phase.accessibilityLabel)
+    }
+}
+
 /// Compact, always-readable corner HUD: live capture-to-screen latency, received
 /// FPS and a ~15 s trend graph. Driven by `LiveLatency` (~4 Hz). Pure SwiftUI so
 /// it stays shareable; the host decides placement, hit-testing and toggling.
 struct LatencyHUD: View {
     @ObservedObject var live: LiveLatency
-    let transport: String
+    let phase: ConnectionPhase
     let codec: String
 
     private var color: Color {
@@ -174,13 +201,29 @@ struct LatencyHUD: View {
             }
             BarGraph(samples: live.trend, ceiling: 80, good: 30, warn: 60, reference: nil)
                 .frame(width: 120, height: 22)
-            Text(footer)
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.55))
+            HStack(spacing: 6) {
+                TransportBadge(phase: phase)
+                if !footer.isEmpty {
+                    Text(footer)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .lineLimit(1)
+                }
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
+        // One element: the transport is always part of what is read.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Stats")
+        .accessibilityValue(accessibilitySummary)
+    }
+
+    private var accessibilitySummary: String {
+        let latency = live.latencyMs > 0 ? String(format: "Latency %.0f milliseconds", live.latencyMs)
+                                         : "Latency not measured"
+        return "\(phase.accessibilityLabel). \(latency). \(live.fps) frames per second."
     }
 
     private var kindLabel: String {
@@ -197,7 +240,6 @@ struct LatencyHUD: View {
             parts.append(String(format: "p50 %.0f", live.p50))
             parts.append(String(format: "p95 %.0f", live.p95))
         }
-        if transport != "—" { parts.append(transport) }
         if !codec.isEmpty { parts.append(codec) }
         return parts.joined(separator: " · ")
     }
