@@ -63,6 +63,17 @@ final class ConnectionIndicatorTests: XCTestCase {
         XCTAssertEqual(i.phase.accessibilityLabel, "Not connected to a Mac")
     }
 
+    func testSettingsIconTracksActualTransportAndTransitions() {
+        XCTAssertEqual(ConnectionPhase.streaming(.usb).settingsSymbol, "cable.connector.horizontal")
+        XCTAssertEqual(ConnectionPhase.streaming(.wifi).settingsSymbol, "wifi")
+        XCTAssertEqual(ConnectionPhase.connecting(.usb).settingsSymbol, "cable.connector.horizontal")
+        XCTAssertEqual(ConnectionPhase.switching(to: .wifi).settingsSymbol, "wifi")
+        XCTAssertEqual(ConnectionPhase.switching(to: .usb).settingsSymbol, "cable.connector.horizontal")
+        XCTAssertEqual(ConnectionPhase.reconnecting(after: .usb).settingsSymbol, "arrow.triangle.2.circlepath")
+        XCTAssertEqual(ConnectionPhase.disconnected.settingsSymbol, "antenna.radiowaves.left.and.right")
+        XCTAssertTrue(streaming(.wifi).phase.accessibilityLabel.contains("Wi-Fi"))
+    }
+
     // MARK: Unplug -> Wi-Fi
 
     func testUnplugFallsBackToWiFiAndConfirmsOnlyAfterFrames() {

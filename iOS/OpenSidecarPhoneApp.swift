@@ -37,7 +37,7 @@ struct DuoDisplayPhoneApp: App {
     @UIApplicationDelegateAdaptor(DuoPhoneAppDelegate.self) private var appDelegate
     var body: some Scene {
         WindowGroup {
-            ReceiverScreen()
+            ReceiverScreen().modifier(PairingApprovalPresenter())
         }
     }
 }
@@ -345,6 +345,8 @@ struct IdleView: View {
     @ObservedObject var receiver: StreamReceiver
     @Binding var showSettings: Bool
     @State private var connectionHelp = 0
+    @ObservedObject private var pairingDiscovery = PairingDiscovery.shared
+    @ObservedObject private var trusted = TrustedConnections.shared
     @AppStorage("deviceName") private var deviceName = ""
     @ScaledMetric(relativeTo: .largeTitle) private var titleSize = 30.0
 
@@ -408,6 +410,29 @@ struct IdleView: View {
 
     private var pairing: some View {
         VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Your Macs").font(.headline)
+                ForEach(trusted.macs, id: \.endpoint) { mac in
+                    Button("Connect to \(trusted.name(mac))") { trusted.connect(mac) }
+                        .disabled(trusted.connecting || receiver.connected)
+                }
+                Text(trusted.status).font(.footnote)
+                if trusted.connecting { Button("Cancel") { trusted.cancel() } }
+            }.onAppear { trusted.browse(receiver: receiver) }
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Pair with your Mac").font(.headline)
+                Text("On your Mac, choose Pair a phone. Then confirm the code on both devices.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                ForEach(pairingDiscovery.macs, id: \.endpoint) { mac in
+                    if case .service(let name, _, _, _) = mac.endpoint {
+                        Button("Pair with \(name)") {
+                            pairingDiscovery.pair(with: mac, name: PhoneName.current().name)
+                        }
+                    }
+                }
+                Text(pairingDiscovery.status).font(.footnote)
+                Button("Find Macs") { pairingDiscovery.browse() }
+            }
             Picker("Connection instructions", selection: $connectionHelp) {
                 Text("USB").tag(0)
                 Text("Wi-Fi").tag(1)
@@ -626,7 +651,7 @@ struct SettingsView: View {
             Form {
                 Section {
                     HStack(spacing: 12) {
-                        Image(systemName: receiver.link.phase.symbol)
+                        Image(systemName: receiver.link.phase.settingsSymbol)
                             .font(.title3)
                             .foregroundStyle(receiver.link.phase.isStreaming ? Color.green
                                              : receiver.link.phase.isInTransition ? Color.orange
@@ -646,6 +671,9 @@ struct SettingsView: View {
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(receiver.link.phase.accessibilityLabel)
                     .accessibilityValue(receiver.status)
+                    if receiver.pairedSession {
+                        Button("Disconnect from Mac") { receiver.disconnectPairedStream() }
+                    }
                     if receiver.connected && receiver.videoSize != .zero {
                         LabeledRow("Resolution", value: "\(Int(receiver.videoSize.width)) × \(Int(receiver.videoSize.height))")
                         LabeledRow("Frame rate", value: "\(receiver.fps) FPS")

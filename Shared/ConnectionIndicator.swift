@@ -93,6 +93,16 @@ enum ConnectionPhase: Equatable {
         }
     }
 
+    /// Settings uses a horizontal cable glyph so USB is distinct from a chain link.
+    var settingsSymbol: String {
+        switch self {
+        case .connecting(.usb), .streaming(.usb), .switching(to: .usb):
+            return "cable.connector.horizontal"
+        default:
+            return symbol
+        }
+    }
+
     /// Compact stats: a word or two.
     var shortLabel: String {
         switch self {

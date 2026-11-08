@@ -20,6 +20,7 @@ import CoreMedia
 import VideoToolbox
 import QuartzCore
 import ImageIO
+import CryptoKit
 
 /// One-second window of pipeline health, plus per-frame timing samples for
 /// the performance overlay graph.
@@ -132,6 +133,85 @@ final class StreamReceiver: ObservableObject {
     private var framesOnConnection = 0   // receive queue
 
     private var listener: NWListener?
+    private var pairedListener: NWListener?
+    private var pairedIdentity: String?
+    private var pairedKeyFingerprint: Data?
+    private var pairedLANRequired = false
+    private var pairedConnection: NWConnection?
+    @Published private(set) var pairedSession = false
+    private var pendingPairedConnections: [NWConnection] = []
+
+    /// Local integration entry point; the pairing UI must call this only for
+    /// a verified Keychain peer. Separate TLS port preserves usbmux on 9000.
+    func startPairedStream(peerID: String, identity: String) throws {
+        guard let key = try SecurePairingKeyStore.load(peerID: peerID) else {
+            throw SecurePairingKeyStore.StoreError.invalidPeer
+        }
+        try startPairedStream(key: key, identity: identity, onReady: nil)
+    }
+
+    /// Injecting a key is internal-only for the local receiver integration test.
+    func startPairedStream(key: SymmetricKey, identity: String,
+                           onReady: ((NWEndpoint.Port) -> Void)?) throws {
+        let secure = try NWListener(using: PairedTransport.parameters(key: key, identity: identity))
+        secure.service = NWListener.Service(name: PairedTransport.streamService(identity), type: PairedTransport.serviceType)
+        let fingerprint = key.withUnsafeBytes { Data(SHA256.hash(data: Data($0))) }
+        queue.async {
+            if self.pairedIdentity == identity, self.pairedKeyFingerprint == fingerprint,
+               let existing = self.pairedListener, case .ready = existing.state, let port = existing.port {
+                secure.cancel()
+                onReady?(port)
+                return
+            }
+            self.pairedIdentity = identity
+            self.pairedKeyFingerprint = fingerprint
+            self.pairedListener?.cancel()
+            self.pendingPairedConnections.forEach { $0.cancel() }
+            self.pendingPairedConnections.removeAll()
+            self.pairedListener = secure
+            self.pairedLANRequired = true
+            secure.newConnectionHandler = { [weak self, weak secure] candidate in
+                guard let self, let secure, self.pairedListener === secure else { candidate.cancel(); return }
+                guard self.pendingPairedConnections.count < 8 else { candidate.cancel(); return }
+                self.pendingPairedConnections.append(candidate)
+                // NWConnection.ready is reached only after the TLS PSK handshake.
+                candidate.stateUpdateHandler = { [weak self, weak secure] state in
+                    guard let self, let secure, self.pairedListener === secure else { candidate.cancel(); return }
+                    if case .ready = state {
+                        guard self.pendingPairedConnections.contains(where: { $0 === candidate }) else {
+                            candidate.cancel(); return
+                        }
+                        self.pendingPairedConnections.removeAll { $0 === candidate }
+                        self.cursorListener?.cancel()
+                        self.cursorListener = nil
+                        self.cursorListenerReady = false
+                        self.adopt(candidate, authenticated: true)
+                    }
+                }
+                candidate.start(queue: self.queue)
+                self.queue.asyncAfter(deadline: .now() + 15) {
+                    self.pendingPairedConnections.removeAll { $0 === candidate }
+                    if candidate !== self.connection { candidate.cancel() }
+                }
+            }
+            secure.stateUpdateHandler = { [weak self, weak secure] state in
+                guard let self, let secure, self.pairedListener === secure else { return }
+                if case .ready = state, let port = secure.port { onReady?(port) }
+            }
+            secure.start(queue: self.queue)
+        }
+    }
+    func disconnectPairedStream(stopListening: Bool = false) {
+        queue.async {
+            if stopListening { self.pairedListener?.cancel(); self.pairedListener = nil }
+            self.pendingPairedConnections.forEach { $0.cancel() }; self.pendingPairedConnections = []
+            if let connection = self.connection, connection === self.pairedConnection {
+                self.closeSession(announcing: WireMessage.closing, status: "Disconnected", completion: nil)
+            }
+            DispatchQueue.main.async { self.pairedSession = false }
+        }
+    }
+
     private var listenerHealthy = false
     private var connection: NWConnection?
     // Cursor side channel: UDP on port+1. Cursor positions ride TCP behind
@@ -467,6 +547,10 @@ final class StreamReceiver: ObservableObject {
         self.port = port
         queue.async {
             self.startListener()
+            if let mac = UserDefaults.standard.string(forKey: "duo.selectedPairedMac"),
+               let own = UserDefaults.standard.string(forKey: "duo.securePairing.localID.v1") {
+                try? self.startPairedStream(peerID: mac, identity: PairedTransport.identity(mac, own))
+            }
             self.armLivenessTimers()
         }
     }
@@ -481,6 +565,10 @@ final class StreamReceiver: ObservableObject {
             self.pingTimer?.cancel(); self.pingTimer = nil
             self.watchdogTimer?.cancel(); self.watchdogTimer = nil
             self.addrWatchTimer?.cancel(); self.addrWatchTimer = nil
+            self.pairedListener?.cancel()
+            self.pairedListener = nil
+            self.pendingPairedConnections.forEach { $0.cancel() }
+            self.pendingPairedConnections.removeAll()
             self.pendingConnections.forEach { $0.cancel() }
             self.pendingConnections.removeAll()
         }
@@ -601,7 +689,7 @@ final class StreamReceiver: ObservableObject {
         }
         cursorListener = udp
         udp.newConnectionHandler = { [weak self] conn in
-            guard let self, self.cursorListener === udp else { conn.cancel(); return }
+            guard let self, self.cursorListener === udp, !self.pairedLANRequired else { conn.cancel(); return }
             // A UDP "connection" is one remote host:port flow. The newest
             // one is the live sender (a rebuilt sender socket gets a fresh
             // ephemeral port) and starts its sequence over.
@@ -800,7 +888,14 @@ final class StreamReceiver: ObservableObject {
     /// without the cursor port while it proved itself (see the listener), with
     /// the bytes it sent back in `initialData`. Once adopted, the full hello
     /// opens a cursor flow that unambiguously belongs to this session.
-    private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
+    private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil,
+                       authenticated: Bool = false) {
+        guard !pairedLANRequired || authenticated || DirectCable.isLoopback(conn.endpoint) else {
+            conn.cancel()
+            return
+        }
+        pairedConnection = authenticated ? conn : nil
+        DispatchQueue.main.async { self.pairedSession = authenticated }
         if greeted { Log.info("newcomer proved itself — adopting it as the session") }
         transport = DirectCable.isLoopback(conn.endpoint) ? "USB" : "WiFi"
         // Loopback is certain (usbmuxd). A network socket's interface is only

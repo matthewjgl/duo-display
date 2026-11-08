@@ -149,6 +149,7 @@ final class DeviceSession: ObservableObject, Identifiable {
     // error text remains. A failed session must never swallow a fresh
     // connect for its device the way a live one does.
     @Published var failed = false
+    var startTask: Task<Void, Never>?
     @Published var wirelessHandoffAllowed = false
     @Published var selectedQuality: StreamQuality = .best
     @Published var guidance: ConnectionGuidance?
@@ -270,6 +271,7 @@ final class SenderController: ObservableObject {
 
     @Published var sessions: [DeviceSession] = []
     @Published var discovered: [NWBrowser.Result] = []
+    private var pairedRoutes: [String: (peer: String, endpoint: NWEndpoint)] = [:]
     // Every cabled device: usbmuxd's iPhones and iPads plus Android devices
     // in accessory mode (udid `aoa:<serial>`). The connection policy treats
     // them alike.
@@ -426,6 +428,23 @@ final class SenderController: ObservableObject {
             Task { @MainActor in self?.refreshMenuBarReadout() }
         }
         startBrowsing()
+        TrustedConnections.shared.serve(name: Host.current().localizedName ?? "Mac") { [weak self] peer, receiverID, endpoint in
+            guard let self else { return "Mac unavailable." }
+            guard CGPreflightScreenCaptureAccess() else { return "On the Mac, enable Duo Display in Privacy & Security → Screen Recording, then reopen it." }
+            guard InputInjector.hasInputControlPermission else { return "On the Mac, enable Duo Display input control in Privacy & Security, then reopen it." }
+            guard let result = self.discovered.first(where: { self.txtID(of: $0) == receiverID }) else { return "Phone discovery is still pending. Keep both apps open and retry." }
+            var bindings = UserDefaults.standard.dictionary(forKey: "duo.receiverPairBindings.v1") as? [String: String] ?? [:]
+            if let existing = bindings[receiverID], existing != peer { return "This receiver identity belongs to another pairing. Pair again explicitly." }
+            bindings[receiverID] = peer
+            UserDefaults.standard.set(bindings, forKey: "duo.receiverPairBindings.v1")
+            if let session = self.activeSession(coveringWiFi: result), !session.failed {
+                if session.onUSB { return "This device is streaming over USB. Unplug before requesting Wi-Fi." }
+                if session.sender.requiredPairedPeer?.peerID == peer, !session.transportPending { return nil }
+                self.end(session)
+            }
+            self.connect(to: .wifi(result), paired: (peer, endpoint))
+            return nil
+        }
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             self?.usbmuxDevices = devices
             self?.wiredDevicesChanged()
@@ -864,7 +883,21 @@ final class SenderController: ObservableObject {
     }
 
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
-                 awaitingWake: Bool = false) {
+                 awaitingWake: Bool = false,
+                 paired: (peer: String, endpoint: NWEndpoint)? = nil) {
+        let paired: (peer: String, endpoint: NWEndpoint)? = {
+            if let paired {
+                if case .wifi(let result) = target, let receiverID = txtID(of: result) { pairedRoutes[receiverID] = paired }
+                return paired
+            }
+            if case .wifi(let result) = target, let receiverID = txtID(of: result) {
+                if let route = pairedRoutes[receiverID] { return route }
+                if let peer = (UserDefaults.standard.dictionary(forKey: "duo.receiverPairBindings.v1") as? [String: String])?[receiverID] {
+                    return (peer, PairedTransport.endpoint(mac: PairingApprovalCoordinator.localID, phone: peer))
+                }
+            }
+            return nil
+        }()
         let id = target.sessionID
         if userInitiated, case .usb(let udid?) = target,
            installIDByUDID[udid] == nil,
@@ -924,7 +957,7 @@ final class SenderController: ObservableObject {
                 transport = wiredTransport(udid: udid, port: portNum)
             }
         case .wifi(let result):
-            transport = .tcp(result.endpoint)
+            transport = .tcp(paired?.endpoint ?? result.endpoint)
         }
 
         let name = label(for: target)
@@ -944,6 +977,10 @@ final class SenderController: ObservableObject {
                                quality: selectedQuality, displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake, expectedPeerID: expectedID)
+        if let paired {
+            sender.requiredPairedPeer = (paired.peer, TrustedConnections.identity(PairingApprovalCoordinator.localID, paired.peer))
+            sender.pairedWiFiEndpoint = PairedTransport.endpoint(mac: PairingApprovalCoordinator.localID, phone: paired.peer)
+        }
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         session.selectedQuality = selectedQuality
         let initialName = resolvedName(key: DeviceNameKey.make(installID: knownID, udid: usbUDID),
@@ -990,6 +1027,11 @@ final class SenderController: ObservableObject {
             }
             if case .usb(let udid?) = session.target, let installID = info.id {
                 self.installIDByUDID[udid] = installID
+                if let peer = (UserDefaults.standard.dictionary(forKey: "duo.receiverPairBindings.v1") as? [String: String])?[installID] {
+                    session.sender.configurePairedPeer(peerID: peer,
+                        identity: PairedTransport.identity(PairingApprovalCoordinator.localID, peer),
+                        endpoint: PairedTransport.endpoint(mac: PairingApprovalCoordinator.localID, phone: peer))
+                }
             }
             self.dedupeSessions()
             // The learned identity may reveal that this WiFi session's device
@@ -1082,7 +1124,7 @@ final class SenderController: ObservableObject {
             self.end(session)
         }
         sessions.append(session)
-        Task {
+        session.startTask = Task {
             do {
                 try await sender.start()
             } catch is CancellationError {
@@ -1134,6 +1176,7 @@ final class SenderController: ObservableObject {
     }
 
     private func end(_ session: DeviceSession) {
+        session.startTask?.cancel(); session.startTask = nil
         session.sender.stop()
         sessions.removeAll { $0.id == session.id }
     }
@@ -1485,6 +1528,10 @@ struct ContentView: View {
     }
 
     var body: some View {
+        content.modifier(PairingApprovalPresenter())
+    }
+
+    private var content: some View {
         HStack(spacing: 0) {
             sidebar
             Divider()
@@ -1496,6 +1543,9 @@ struct ContentView: View {
                     }
                     Spacer()
                     if page == .devices {
+                        Button("Pair a phone") {
+                            PairingDiscovery.shared.advertise(name: Host.current().localizedName ?? "Mac")
+                        }
                         Button(action: arrangeDisplays) {
                             Label("Arrange Displays…", systemImage: "rectangle.3.group")
                         }

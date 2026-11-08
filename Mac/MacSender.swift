@@ -439,6 +439,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Lifecycle
 
     func start() async throws {
+        try Task.checkCancellation()
         stopped = false
         queue.async { self.connect() }   // dial state lives on `queue`
         if !monitorsStarted {
@@ -2103,7 +2104,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         return result
     }
 
+    /// Set only by an explicitly verified pair before the pipeline starts.
+    var requiredPairedPeer: (peerID: String, identity: String)?
+    var pairedWiFiEndpoint: NWEndpoint?
+    func configurePairedPeer(peerID: String, identity: String, endpoint: NWEndpoint) {
+        queue.async {
+            self.requiredPairedPeer = (peerID, identity)
+            self.pairedWiFiEndpoint = endpoint
+            self.closeCursorChannel()
+        }
+    }
+
     private func connectTCP(_ endpoint: NWEndpoint) {
+        let endpoint = requiredPairedPeer == nil ? endpoint : (pairedWiFiEndpoint ?? endpoint)
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         // No interface steering: macOS already ranks a Thunderbolt Bridge or
@@ -2111,7 +2124,21 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // there is one (field-tested: en10 chosen over en0). A WiFi-prohibited
         // pre-dial was tried and only ever hung until its timeout, adding 2s
         // to every connect. becomeReady reports which path won.
-        let params = NWParameters(tls: nil, tcp: options)
+        let params: NWParameters
+        if let pair = requiredPairedPeer {
+            do {
+                guard let key = try SecurePairingKeyStore.load(peerID: pair.peerID) else {
+                    reportGone("Paired key missing — pair again before connecting")
+                    return
+                }
+                params = PairedTransport.parameters(key: key, identity: pair.identity)
+            } catch {
+                reportGone("Paired key unavailable — pair again before connecting")
+                return
+            }
+        } else {
+            params = NWParameters(tls: nil, tcp: options)
+        }
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         // A dial to a withdrawn Bonjour service (receiver asleep or app
@@ -2468,6 +2495,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Bonjour or Thunderbolt-bridged dial lands on the same interface. Any
     /// failure here is silent: the cursor keeps riding TCP.
     private func openCursorChannel(port: Int) {
+        // Paired sessions carry cursor and touch on authenticated TLS TCP.
+        guard requiredPairedPeer == nil else { closeCursorChannel(); return }
         guard case .tcp = transport, let conn = connection, connectionReady,
               port > 0, port <= Int(UInt16.max),
               let udpPort = NWEndpoint.Port(rawValue: UInt16(port)) else {

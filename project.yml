@@ -58,7 +58,7 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         NSLocalNetworkUsageDescription: Duo Display connects to your iPad or iPhone over the local network in WiFi mode.
-        NSBonjourServices: ["_opensidecar._tcp"]
+        NSBonjourServices: ["_opensidecar._tcp", "_duopair._tcp", "_duoconnect._tcp", "_duostream._tcp"]
         LSApplicationCategoryType: public.app-category.utilities
         # Duo Display feeds are release assets, independent of website deployment.
         SUFeedURL: https://github.com/matthewjgl/duo-display/releases/latest/download/appcast.xml
@@ -116,7 +116,7 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSLocalNetworkUsageDescription: Duo Display Receiver advertises itself on the local network so another Mac can connect and use this Mac as a display.
-        NSBonjourServices: ["_opensidecar._tcp"]
+        NSBonjourServices: ["_opensidecar._tcp", "_duopair._tcp", "_duoconnect._tcp", "_duostream._tcp"]
         NSAppleEventsUsageDescription: Duo Display Receiver shuts this Mac down when the connected Mac asks it to.
         LSApplicationCategoryType: public.app-category.utilities
         # Duo Display feeds are release assets, independent of website deployment.
@@ -167,6 +167,14 @@ targets:
       - Shared/Protocol.swift
       - Shared/TransportSwitch.swift
       - Shared/ConnectionIndicator.swift
+      - Shared/SecurePairing.swift
+      - Shared/PairedTransport.swift
+      - Shared/SecurePairingKeyStore.swift
+      - Shared/PairingApprovalCoordinator.swift
+      - Shared/PairingExchange.swift
+      - Shared/TrustedConnections.swift
+      - Shared/StreamReceiver.swift
+      - Shared/AppStore.swift
       - Shared/ConnectionHealth.swift
       - Shared/ReceiverOrientation.swift
       - Shared/DirectCable.swift
@@ -214,7 +222,7 @@ targets:
         UIRequiresFullScreen: true
         UIRequiresFullScreenIgnoredStartingWithVersion: "27"
         NSLocalNetworkUsageDescription: Duo Display advertises itself on the local network so your Mac can connect over WiFi.
-        NSBonjourServices: ["_opensidecar._tcp"]
+        NSBonjourServices: ["_opensidecar._tcp", "_duopair._tcp", "_duoconnect._tcp", "_duostream._tcp"]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
