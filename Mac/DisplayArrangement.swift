@@ -21,6 +21,7 @@ enum DisplayArrangement {
     /// possible opt-in, see #128).
     static func save(origin: CGPoint, size: CGSize, device: String) {
         let rect = CGRect(origin: origin, size: size)
+        guard valid(rect) else { return }
         let previousSide = load(device)?.side
         let main = CGDisplayBounds(CGMainDisplayID())
         let side = side(of: rect, relativeTo: main, preferring: previousSide)
@@ -74,11 +75,40 @@ enum DisplayArrangement {
         // every fold or rotation, ~0.5 s of stale picture each, and the
         // record never heals because snaps are not saved (#203). The display
         // already sits somewhere valid: keep it on its side from there.
-        guard let current, !fits(CGRect(origin: candidate, size: size), among: others) else {
-            return candidate
+        return safeOrigin(candidate: candidate, size: size, main: main,
+                          others: others, current: current)
+    }
+
+    /// A disconnected monitor's saved position must never create an unreachable
+    /// desktop. Prefer the user's current placement, then the nearest valid edge.
+    static func safeOrigin(candidate: CGPoint, size: CGSize, main: CGRect,
+                           others: [CGRect], current: CGRect?) -> CGPoint {
+        let displays = others.filter { valid($0) }
+        let neighbours = displays.isEmpty ? [main] : displays
+        func accepts(_ point: CGPoint) -> Bool {
+            let rect = CGRect(origin: point, size: size)
+            return valid(rect) && fits(rect, among: neighbours)
         }
-        let fromCurrent = remappedOrigin(from: current, to: size, against: others)
-        return fits(CGRect(origin: fromCurrent, size: size), among: others) ? fromCurrent : candidate
+        if accepts(candidate) { return candidate }
+        if let current, valid(current) {
+            let remapped = remappedOrigin(from: current, to: size, against: neighbours)
+            if accepts(remapped) { return remapped }
+        }
+        let choices = neighbours.flatMap { rect in
+            [CGPoint(x: rect.maxX, y: rect.minY),
+             CGPoint(x: rect.minX - size.width, y: rect.minY),
+             CGPoint(x: rect.minX, y: rect.maxY),
+             CGPoint(x: rect.minX, y: rect.minY - size.height)]
+        }.filter(accepts)
+        let reference = candidate.x.isFinite && candidate.y.isFinite ? candidate : main.origin
+        return choices.min {
+            hypot($0.x - reference.x, $0.y - reference.y) < hypot($1.x - reference.x, $1.y - reference.y)
+        } ?? CGPoint(x: main.maxX, y: main.minY)
+    }
+
+    private static func valid(_ rect: CGRect) -> Bool {
+        [rect.minX, rect.minY, rect.width, rect.height].allSatisfy { $0.isFinite && abs($0) <= 1_000_000 }
+            && rect.width > 0 && rect.height > 0
     }
 
     /// Whether WindowServer would take `rect` as asked: it overlaps no
@@ -168,6 +198,7 @@ enum DisplayArrangement {
               record.count == 4 || record.count == 5 else { return nil }
         let rect = CGRect(x: CGFloat(record[0]), y: CGFloat(record[1]),
                           width: CGFloat(record[2]), height: CGFloat(record[3]))
+        guard valid(rect) else { return nil }
         return Placement(rect: rect, side: record.count == 5 ? Side(rawValue: record[4]) : nil)
     }
 

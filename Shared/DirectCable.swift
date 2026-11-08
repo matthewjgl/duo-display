@@ -11,6 +11,18 @@ import Network
 /// Remaining gap: a switch with no DHCP server and no IPv6 router looks
 /// exactly like the cable.
 enum DirectCable {
+    /// usbmux forwards through loopback; compare addresses, not formatted
+    /// endpoint strings (IPv6 descriptions may include brackets).
+    static func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        switch host {
+        case .ipv4(let address): return address == .loopback
+        case .ipv6(let address): return address == .loopback
+        case .name(let name, _): return name.lowercased() == "localhost"
+        @unknown default: return false
+        }
+    }
+
     /// The path is wired, the far end is link-local, and the local interface
     /// carrying it holds only link-local addresses. Judged from this side of
     /// the connection only: nothing the peer says can change it.

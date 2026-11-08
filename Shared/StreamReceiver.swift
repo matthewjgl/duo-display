@@ -1,3 +1,4 @@
+import dnssd
 // StreamReceiver — the listening half of Duo Display: receive video over
 // TCP and display it. Compiled into BOTH targets (see project.yml): it is
 // the iOS app's core, and the Mac app's receiver mode (issue #82) reuses it
@@ -83,6 +84,7 @@ enum PeerUpdateSignal: Equatable {
 final class StreamReceiver: ObservableObject {
 
     @Published var status = "Starting…"
+    @Published private(set) var networkGuidance: ConnectionGuidance?
     @Published var fps = 0
     @Published var connected = false
     @Published var videoSize = CGSize.zero   // for touch coordinate mapping
@@ -665,9 +667,6 @@ final class StreamReceiver: ObservableObject {
             Log.info("new connection from \(String(describing: conn.endpoint))")
             // usbmux-forwarded (cable) connections arrive from loopback;
             // anything else came over the network.
-            let peer = String(describing: conn.endpoint)
-            self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
-                              || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
             // A Bonjour dial races IPv6 and IPv4 and both handshakes can
             // complete; the sender cancels its loser within milliseconds.
             // Adopting every newcomer at once evicted the winner for a
@@ -720,8 +719,20 @@ final class StreamReceiver: ObservableObject {
             switch state {
             case .ready:
                 self.listenerHealthy = true
+                DispatchQueue.main.async { self.networkGuidance = nil }
                 self.setStatus("Ready to connect")
+            case .waiting(let error):
+                self.listenerHealthy = false
+                DispatchQueue.main.async { self.networkGuidance = .discoveryError(error, on: .phone) }
             case .failed(let error):
+                DispatchQueue.main.async { self.networkGuidance = .discoveryError(error, on: .phone) }
+                if case .dns(let code) = error, code == kDNSServiceErr_PolicyDenied {
+                    self.listenerHealthy = false
+                    self.setStatus("Local Network access is needed for Wi-Fi discovery")
+                    // Permission changes are retried on foreground or the
+                    // explicit retry action, not in a one-second failure loop.
+                    return
+                }
                 Log.info("listener failed: \(error) — restarting in 1s")
                 self.listenerHealthy = false
                 self.setStatus("Listener failed — restarting…")
@@ -742,6 +753,7 @@ final class StreamReceiver: ObservableObject {
     /// opens a cursor flow that unambiguously belongs to this session.
     private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
         if greeted { Log.info("newcomer proved itself — adopting it as the session") }
+        transport = DirectCable.isLoopback(conn.endpoint) ? "USB" : "WiFi"
         connection?.cancel()
         connection = conn
         // The race is decided: rival candidates die here.
@@ -955,7 +967,7 @@ final class StreamReceiver: ObservableObject {
         case WireMessage.updateRequired:
             // The Mac refuses this pairing until we update from the App Store.
             let message = obj["message"] as? String
-                ?? "Update Duo Display from the App Store to keep using your second display."
+                ?? "Update Duo Display from \(AppStore.updateSourceName) to keep using your second display."
             let store = (obj["store"] as? String).flatMap { URL(string: $0) } ?? AppStore.updateURL
             DispatchQueue.main.async { self.peerSignal = .updateReceiver(message: message, storeURL: store) }
         default:

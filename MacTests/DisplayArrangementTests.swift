@@ -148,7 +148,8 @@ final class DisplayArrangementTests: XCTestCase {
         let live = DisplayArrangement.origin(for: folded, saved: stale, side: nil, main: main,
                                              others: [main], current: current)
 
-        XCTAssertEqual(creation, CGPoint(x: 4_637, y: 495), "creation still asks for the saved spot")
+        XCTAssertTrue(DisplayArrangement.fits(CGRect(origin: creation, size: folded), among: [main]),
+                      "initial creation repairs a saved position left on a disconnected monitor")
         XCTAssertEqual(live, CGPoint(x: 1_512, y: 290))
     }
 

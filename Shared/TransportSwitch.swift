@@ -21,14 +21,20 @@ import Foundation
 /// session down, so the receiver goes back to its idle screen as before.
 struct TransportSwitchTracker: Equatable {
     enum Target: String, Equatable {
+        /// The Mac announced it is moving the session to Wi-Fi.
         case wifi
+        /// The Mac announced it is moving the session to USB.
         case usb
+        /// Inferred locally: the USB link died with no announcement. The Mac
+        /// never sends this value; it only distinguishes the on-screen copy.
+        case usbLost
 
         /// The exact on-screen strings.
         var label: String {
             switch self {
             case .wifi: return "Switching to Wi-Fi · wireless mode"
             case .usb: return "Switching to USB mode"
+            case .usbLost: return "USB disconnected · waiting to reconnect"
             }
         }
     }
@@ -64,7 +70,11 @@ struct TransportSwitchTracker: Equatable {
         guard !peerEndedSession, hadFrames else { return isActive }
         // Only a dead USB link is read as an unplug. A Wi-Fi drop is a network
         // blip or a Mac that went away: no promise of a switch to make.
-        if lastTransport == "USB" { begin(.wifi, now: now) }
+        // A deliberate announcement outranks inference from the retiring
+        // socket. Otherwise an old USB close can overwrite a USB handoff
+        // (or a late close can dismiss a new recovery too early).
+        if let target { begin(target, now: now) }
+        else if lastTransport == "USB" { begin(.usbLost, now: now) }
         return isActive
     }
 
@@ -117,7 +127,7 @@ struct TransportSwitchTracker: Equatable {
     }
 
     private mutating func begin(_ newTarget: Target, now: Date) {
-        if target == nil { shownAt = now }
+        if target == nil || target != newTarget { shownAt = now }
         // A new announcement for a different target (or a second one for the
         // same switch) re-arms the wait for the new link; the overlay stays up.
         target = newTarget

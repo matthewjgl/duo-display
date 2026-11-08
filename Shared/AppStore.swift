@@ -9,8 +9,16 @@ enum AppStore {
     static let iOSAppID = "6830472572"
     /// Duo Display is currently distributed through TestFlight, not a public listing.
     static let isPubliclyAvailable = false
-    /// Opens the App Store app directly on the listing (with an Update button).
-    static let updateURL = URL(string: "itms-apps://apps.apple.com/app/id\(iOSAppID)")!
+    /// Public TestFlight invite for the beta group (see TESTFLIGHT.md). It
+    /// opens TestFlight, which offers the newest build to install.
+    static let testFlightURL = URL(string: "https://testflight.apple.com/join/JkWMAuVD")!
+    /// Where an outdated iOS app is sent to update: the App Store listing once
+    /// public, TestFlight until then (the listing does not exist yet).
+    static let updateURL = isPubliclyAvailable
+        ? URL(string: "itms-apps://apps.apple.com/app/id\(iOSAppID)")!
+        : testFlightURL
+    /// How update prompts name that place.
+    static let updateSourceName = isPubliclyAvailable ? "the App Store" : "TestFlight"
     /// Web fallback for anywhere the itms-apps scheme can't be handled.
     static let webURL = URL(string: "https://apps.apple.com/app/id\(iOSAppID)")!
     /// The listing's "Write a Review" sheet: opens in the App Store app on

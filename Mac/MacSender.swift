@@ -84,7 +84,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var transport: SenderTransport
     private let endpointName: String
     private let mode: CaptureMode
-    private let quality: StreamQuality
+    private var selectedQuality: StreamQuality
+    private var quality: StreamQuality {
+        pipelineLock.lock(); defer { pipelineLock.unlock() }
+        return selectedQuality
+    }
+    private var peerIdentity: PeerIdentityGate
+    private var switchingTransport = false
+    @MainActor var onTransportReady: ((Bool) -> Void)?
+    @MainActor var onTransportUnavailable: (() -> Void)?
+    @MainActor var onIdentityMismatch: (() -> Void)?
+    @MainActor var onUSBUnavailable: (() -> Void)?
     // Stable per-device serial for the virtual display, so macOS can tell
     // multiple Duo Display monitors apart and persist their arrangement.
     private let displaySerial: UInt32
@@ -397,11 +407,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(transport: SenderTransport, name: String, mode: CaptureMode,
          quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
-         identityOffset: UInt32 = 0, awaitingWake: Bool = false) {
+         identityOffset: UInt32 = 0, awaitingWake: Bool = false, expectedPeerID: String? = nil) {
         self.transport = transport
         self.endpointName = name
         self.mode = mode
-        self.quality = quality
+        self.selectedQuality = quality
+        self.peerIdentity = PeerIdentityGate(expected: expectedPeerID)
         self.displaySerial = displaySerial
         self.baseIdentityOffset = identityOffset
         self.awaitingWake = awaitingWake
@@ -537,6 +548,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 + "@\(canvas.scale)x for a \(plan.desktop.pointsWide)x\(plan.desktop.pointsHigh)pt desktop")
         }
         return canvas
+    }
+
+    @discardableResult
+    func setQuality(_ choice: StreamQuality, for deviceID: String?) -> Bool {
+        guard DeviceSetupStore.update(deviceID, { $0.quality = choice.rawValue }) else { return false }
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.pipelineLock.lock()
+            self.selectedQuality = choice
+            self.pipelineLock.unlock()
+            self.scheduleCanvasRebuild()
+        }
+        return true
     }
 
     /// The user's per-device desktop size (the Display size control),
@@ -1495,9 +1519,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// treats it like any reconnect: the fresh connection replaces the old
     /// one and the video resyncs with a keyframe. Which transport to be on
     /// is the controller's call (cable-in upgrade, unplug failover).
-    func switchTransport(to newTransport: SenderTransport) {
+    func switchTransport(to newTransport: SenderTransport, expectedPeerID: String) {
         queue.async { [weak self] in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.stopped,
+                  DeviceIdentity.matches(self.peerIdentity.pinnedID, expectedPeerID) else { return }
+            self.switchingTransport = true
             let label = if case .tcp = newTransport { "WiFi" } else { "USB" }
             Log.info("switching \(self.endpointName) to \(label)")
             // Tell the receiver before the old socket goes, so it can dim its
@@ -1525,9 +1551,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.closeCursorChannel()
             self.stopUpgradeProbing()
             self.pendingSends = 0
-            self.pipelineLock.lock()
-            self.pendingEncodes = 0
-            self.pipelineLock.unlock()
+            // The encoder survives the socket swap. Its outstanding jobs
+            // still count until their callbacks finish.
             self.connect()
         }
     }
@@ -1558,11 +1583,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var goneReported = false
 
     /// Declare the device gone and end the session (must be called on `queue`).
-    private func reportGone(_ reason: String) {
+    private func reportGone(_ reason: String, identityMismatch: Bool = false) {
         guard !goneReported, !stopped else { return }
         goneReported = true
         Log.info(reason)
-        Task { @MainActor in self.onDisconnected?() }
+        Task { @MainActor in
+            if identityMismatch { self.onIdentityMismatch?() }
+            self.onDisconnected?()
+        }
     }
 
     /// A live connection just died (must be called on `queue`). On the
@@ -1620,8 +1648,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func peerServiceWithdrawn() {
         queue.async { [weak self] in
             guard let self, !self.stopped, self.everConnected,
-                  !self.connectionReady else { return }
-            self.reportGone("service withdrawn and connection down — receiver app is gone, ending session")
+                  !self.connectionReady, !self.switchingTransport else { return }
+            // Bonjour withdrawal can also mean roaming or network loss. It
+            // does not prove the app quit; only its explicit closing message
+            // does. Keep the existing bounded recovery deadline.
+            if self.disconnectedSince == nil { self.disconnectedSince = Date() }
+            Task { await self.status("Receiver is no longer discovered — retrying briefly…") }
         }
     }
 
@@ -1800,20 +1832,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.lastCursorSent = (-1, -1, false)
             self.cursorSessionGeneration = readyGeneration
         }
-        everConnected = true
-        awaitingWake = false
-        consecutiveRefusals = 0
-        disconnectedSince = nil
         needsKeyframe = true   // new peer needs SPS/PPS + IDR
         resetFrameRateLimiterForReconnect()
         // Announce an already-running stream before enabling frame sends on
         // this socket. VideoToolbox callbacks run independently of `queue`, so
         // setting connectionReady first would allow the reconnect IDR to win.
         helloSeenOnConnection = false
-        if let selected = activeStreamConfigurationSnapshot, peerAcceptsActiveCodec {
-            sendStreamConfiguration(selected, on: conn)
+        connectionReady = false
+        queue.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, !self.stopped, self.connection === conn,
+                  !self.helloSeenOnConnection else { return }
+            if self.switchingTransport {
+                self.switchingTransport = false
+                Task { @MainActor in self.onTransportUnavailable?() }
+            }
+            self.scheduleReconnect()
         }
-        connectionReady = true
         // Keep cached pixels: ScreenCaptureKit stays quiet on a static
         // display, and the watchdog needs them to force the reconnect IDR.
         cancelDropReplayTimer()
@@ -2077,7 +2111,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.scheduleReconnect()
         }
         conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+            guard let self, self.connection === conn else { return }
             switch state {
             case .ready:
                 self.becomeReady(conn)
@@ -2140,7 +2174,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                     self.connection = conn
                     conn.stateUpdateHandler = { [weak self] state in
-                        guard let self else { return }
+                        guard let self, self.connection === conn else { return }
                         switch state {
                         case .failed(let error):
                             Log.info("usb connection failed: \(error)")
@@ -2160,13 +2194,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             } catch {
                 queue.async {
                     guard generation == self.dialGeneration, !self.stopped else { return }
+                    if self.switchingTransport {
+                        self.switchingTransport = false
+                        Task { @MainActor in self.onTransportUnavailable?() }
+                    }
                     // Distinct guidance per failure: cable missing vs app
                     // closed. Composed on `queue`: awaitingWake lives there.
                     let hint: String
                     switch error {
                     case Usbmux.Failure.noDevice:
+                        Task { @MainActor in self.onUSBUnavailable?() }
                         hint = "Waiting for a USB device — plug in the iPhone or iPad…"
                     case AOA.Failure.noDevice:
+                        Task { @MainActor in self.onUSBUnavailable?() }
                         hint = "Waiting for the Android device — plug it in…"
                     case AOA.Failure.notAccessory:
                         // A locked device refuses accessory mode until unlocked.
@@ -2235,9 +2275,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection = nil
         closeCursorChannel()   // rebuilt from the next hello
         pendingSends = 0
-        pipelineLock.lock()
-        pendingEncodes = 0
-        pipelineLock.unlock()
+        // Outstanding encoder jobs survive redial and retire normally.
         queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             // Generation-guarded so a switchTransport (or another reconnect)
             // that landed in this 1s window supersedes this dial instead of
@@ -2585,6 +2623,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             )
             return
         }
+        guard type == "hello" || type == "ping" || helloSeenOnConnection else { return }
         switch type {
         case "ping":
             // Echo with our clock so the phone can estimate the offset
@@ -2620,7 +2659,34 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         case "hello":
             if let info = try? JSONDecoder().decode(PhoneInfo.self, from: payload) {
+                guard peerIdentity.accept(info.id) else {
+                    connectionReady = false
+                    connection?.cancel()
+                    reportGone("receiver identity mismatch — refusing automatic continuity", identityMismatch: true)
+                    return
+                }
                 let previous = lastHello
+                if previous == nil {
+                    let restored = DeviceSetupStore.quality(info.id, fallback: quality)
+                    pipelineLock.lock(); selectedQuality = restored; pipelineLock.unlock()
+                }
+                everConnected = true
+                awaitingWake = false
+                consecutiveRefusals = 0
+                disconnectedSince = nil
+                switchingTransport = false
+                if !helloSeenOnConnection {
+                    // Discard encodes submitted while this socket was still
+                    // unverified, then require a fresh IDR for the accepted peer.
+                    connectionGeneration &+= 1
+                    let acceptedGeneration = connectionGeneration
+                    cursorQueue.async { self.cursorSessionGeneration = acceptedGeneration }
+                    pendingSends = 0
+                    needsKeyframe = true
+                }
+                connectionReady = true
+                let isUSB: Bool = if case .tcp = transport { false } else { true }
+                Task { @MainActor in self.onTransportReady?(isUSB) }
                 lastHello = info
                 helloSeenOnConnection = true
                 // A fresh dial classifies before the hello names the device —
@@ -3325,7 +3391,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             "store": isMac ? "https://myduodisplay.com" : AppStore.updateURL.absoluteString,
             "message": isMac
                 ? "The Duo Display Receiver app on that Mac is too old for this Mac. Get the latest Duo Display Receiver to reconnect."
-                : "This \(kind) app is too old for this Mac. Update Duo Display from the App Store to reconnect.",
+                : "This \(kind) app is too old for this Mac. Update Duo Display from \(AppStore.updateSourceName) to reconnect.",
         ]
         if let data = try? JSONSerialization.data(withJSONObject: dict),
            let json = String(data: data, encoding: .utf8) {
@@ -3373,8 +3439,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         var frame = Data(bytes: &header, count: 4)
         frame.append(payload)
         pendingSends += 1
+        let generation = connectionGeneration
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
-            guard let self else { return }
+            guard let self, self.connectionGeneration == generation else { return }
             self.pendingSends -= 1
             if let error {
                 Log.info("send error: \(error)")

@@ -157,10 +157,15 @@ targets:
       - Mac/CaptureSourceCheck.swift
       - Mac/AndroidUSBFunction.swift
       - Mac/TransportFailover.swift
+      - Mac/DeviceSetup.swift
+      - Mac/USBPeerProbe.swift
+      - Mac/Usbmux.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift
       - Shared/TransportSwitch.swift
+      - Shared/ConnectionHealth.swift
+      - Shared/ReceiverOrientation.swift
       - Shared/DirectCable.swift
       - Shared/LogSnapshot.swift
       - MacReceiver/FullscreenPreference.swift
@@ -189,6 +194,7 @@ targets:
       path: iOS/Info.plist
       properties:
         CFBundleDisplayName: Duo Display
+        CFBundleName: Duo Display
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -214,5 +220,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.ios
+        PRODUCT_NAME: Duo Display
+        PRODUCT_MODULE_NAME: DuoDisplayIOS
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

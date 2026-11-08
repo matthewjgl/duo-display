@@ -11,7 +11,8 @@ let deviceKind = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
 let macAppURL = URL(string: "https://myduodisplay.com/download")!
 
 @main
-struct OpenSidecarPhoneApp: App {
+struct DuoDisplayPhoneApp: App {
+    @UIApplicationDelegateAdaptor(DuoPhoneAppDelegate.self) private var appDelegate
     var body: some Scene {
         WindowGroup {
             ReceiverScreen()
@@ -38,6 +39,7 @@ extension UIWindow {
 
 struct ReceiverScreen: View {
     @StateObject private var model = ReceiverModel()
+    @AppStorage(ReceiverOrientation.defaultsKey) private var savedOrientation = ReceiverOrientation.automatic.rawValue
     @StateObject private var versionGate = VersionGate()
     @State private var showSettings = false
     @State private var showOnboarding = false
@@ -177,7 +179,11 @@ struct ReceiverScreen: View {
         } message: {
             if let update = recommendedUpdate { Text(update.message) }
         }
-        .task { await versionGate.check() }
+        .task {
+            if ReceiverOrientation.load() != .automatic { ReceiverOrientationController.shared.apply() }
+            await versionGate.check()
+        }
+        .onChange(of: savedOrientation) { _ in ReceiverOrientationController.shared.apply() }
         // Merge the connected Mac's compatibility signal into the same gate.
         .onReceive(model.receiver.$peerSignal) { versionGate.applyPeer($0) }
         .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
@@ -353,7 +359,7 @@ struct IdleView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 Divider()
                 HStack(spacing: 12) {
-                    Image(systemName: "iphone").foregroundStyle(.secondary)
+                    Image(systemName: deviceKind == "iPad" ? "ipad" : "iphone").foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Look for this device").font(.caption).foregroundStyle(.secondary)
                         Text(deviceName).font(.subheadline.weight(.semibold)).lineLimit(2)
@@ -363,6 +369,16 @@ struct IdleView: View {
             }
             .padding(20).frame(maxWidth: .infinity, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 22).fill(Color(.secondarySystemBackground)))
+            if let guidance = receiver.networkGuidance {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(guidance.finding).font(.subheadline.weight(.medium))
+                    Text(guidance.action).font(.footnote).foregroundStyle(.secondary)
+                    Button("Open app settings") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                    }
+                    Button("Retry discovery") { receiver.ensureListening() }
+                }.padding(16).background(RoundedRectangle(cornerRadius: 16).fill(Color(.secondarySystemBackground)))
+            }
             Label("Keep Duo Display open while using your second screen.", systemImage: "display")
                 .font(.footnote).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -549,7 +565,7 @@ struct SettingsView: View {
                             Text(receiver.status).font(.footnote).foregroundStyle(.secondary)
                         }
                     }.padding(.vertical, 4)
-                    if receiver.videoSize != .zero {
+                    if receiver.connected && receiver.videoSize != .zero {
                         LabeledRow("Resolution", value: "\(Int(receiver.videoSize.width)) × \(Int(receiver.videoSize.height))")
                         LabeledRow("Frame rate", value: "\(receiver.fps) FPS")
                     }
@@ -569,6 +585,12 @@ struct SettingsView: View {
                     }.pickerStyle(.segmented)
                     Text(statsDescription).font(.footnote).foregroundStyle(.secondary)
                 } header: { Text("On-screen stats") }
+
+                Section {
+                    ReceiverOrientationPicker()
+                } header: { Text("Remembered orientation") } footer: {
+                    Text("Saved on this \(deviceKind). The Mac uses the actual window orientation so video, cursor and touch stay aligned. iOS may restrict rotation in multitasking or Split View.")
+                }
 
                 Section {
                     Toggle(isOn: $touchRipple) {
@@ -596,7 +618,7 @@ struct SettingsView: View {
                 Section {
                     LabeledRow("Duo Display", value: version)
                     Link("myduodisplay.com", destination: URL(string: "https://myduodisplay.com")!)
-                    Link("Source & licenses", destination: URL(string: "https://github.com/peetzweg/opendisplay")!)
+                    Link("Source & licenses", destination: URL(string: "https://github.com/matthewjgl/duo-display")!)
                     if AppStore.isPubliclyAvailable { Link("Rate Duo Display", destination: AppStore.reviewURL) }
                 } header: { Text("About") }
             }

@@ -98,8 +98,11 @@ final class VersionGate: ObservableObject {
     }
 
     private func branded(_ message: String) -> String {
-        message.replacingOccurrences(of: "OpenDisplay", with: "Duo Display", options: .caseInsensitive)
+        let named = message.replacingOccurrences(of: "OpenDisplay", with: "Duo Display", options: .caseInsensitive)
             .replacingOccurrences(of: "Open Display", with: "Duo Display", options: .caseInsensitive)
+        // Older Macs phrase this as an App Store update; route the copy to
+        // wherever updateURL actually points.
+        return named.replacingOccurrences(of: "the App Store", with: AppStore.updateSourceName)
     }
 
     private func recompute() {
@@ -127,7 +130,7 @@ final class VersionGate: ObservableObject {
     }
 
     private static let requiredFallback =
-        "This version of Duo Display is no longer supported. Update from the App Store to keep using your second display."
+        "This version of Duo Display is no longer supported. Update from \(AppStore.updateSourceName) to keep using your second display."
     private static let recommendedFallback =
         "A newer version of Duo Display is available."
 }
@@ -176,7 +179,7 @@ struct UpdateRequiredView: View {
             Button {
                 UIApplication.shared.open(update.url)
             } label: {
-                Label("Update on the App Store", systemImage: "arrow.down.circle")
+                Label("Update on \(AppStore.isPubliclyAvailable ? "the App Store" : "TestFlight")", systemImage: "arrow.down.circle")
                     .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)

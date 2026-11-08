@@ -61,8 +61,11 @@ enum Usbmux {
     /// Open a TCP connection to `port` on the device. On success the returned
     /// connection is a transparent pipe — usbmuxd is out of the picture.
     static func connect(deviceID: Int, port: UInt16,
-                        queue: DispatchQueue) async throws -> NWConnection {
+                        queue: DispatchQueue, deadline: TimeInterval? = nil) async throws -> NWConnection {
         let conn = try await open(queue: queue)
+        let timeout = deadline.map { _ in DispatchWorkItem { conn.cancel() } }
+        if let deadline, let timeout { queue.asyncAfter(deadline: .now() + deadline, execute: timeout) }
+        defer { timeout?.cancel() }
         do {
             try await send([
                 "MessageType": "Connect",
@@ -198,7 +201,7 @@ enum Usbmux {
         }
     }
 
-    private static func receive(exactly count: Int, on conn: NWConnection) async throws -> Data {
+    static func receive(exactly count: Int, on conn: NWConnection) async throws -> Data {
         try await withCheckedThrowingContinuation { cont in
             conn.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
                 if let data, data.count == count {

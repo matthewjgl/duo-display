@@ -1,6 +1,6 @@
 import XCTest
 
-/// The phone's "Switching to Wi-Fi · wireless mode" / "Switching to USB mode"
+/// The phone's "Switching to Wi-Fi" / "Switching to USB mode" / "USB disconnected"
 /// overlay state (Shared/TransportSwitch.swift), driven with an injected clock.
 final class TransportSwitchTests: XCTestCase {
     private let t0 = Date(timeIntervalSince1970: 1_000_000)
@@ -8,13 +8,14 @@ final class TransportSwitchTests: XCTestCase {
 
     func testExactStrings() {
         XCTAssertEqual(TransportSwitchTracker.Target.wifi.label, "Switching to Wi-Fi · wireless mode")
+        XCTAssertEqual(TransportSwitchTracker.Target.usbLost.label, "USB disconnected · waiting to reconnect")
         XCTAssertEqual(TransportSwitchTracker.Target.usb.label, "Switching to USB mode")
     }
 
     func testUnplugOfStreamingUSBLinkShowsWiFiOverlay() {
         var tracker = TransportSwitchTracker()
         XCTAssertTrue(tracker.linkLost(lastTransport: "USB", hadFrames: true, now: t0))
-        XCTAssertEqual(tracker.target, .wifi)
+        XCTAssertEqual(tracker.target, .usbLost)
     }
 
     func testWiFiDropOrNeverStreamedShowsNothing() {
@@ -59,7 +60,7 @@ final class TransportSwitchTests: XCTestCase {
         tracker.linkLost(lastTransport: "USB", hadFrames: true, now: t0)
         tracker.streamResumed(now: at(0.3))            // Wi-Fi streamed already
         XCTAssertFalse(tracker.tick(now: at(0.4)))
-        XCTAssertEqual(tracker.target, .wifi)
+        XCTAssertEqual(tracker.target, .usbLost)
         XCTAssertFalse(tracker.tick(now: at(1.4)))
         XCTAssertTrue(tracker.tick(now: at(1.5)))
         XCTAssertNil(tracker.target)
@@ -78,7 +79,7 @@ final class TransportSwitchTests: XCTestCase {
         var tracker = TransportSwitchTracker()
         tracker.linkLost(lastTransport: "USB", hadFrames: true, now: t0)
         XCTAssertFalse(tracker.tick(now: at(11.9)))
-        XCTAssertEqual(tracker.target, .wifi)
+        XCTAssertEqual(tracker.target, .usbLost)
         XCTAssertTrue(tracker.tick(now: at(12)))
         XCTAssertNil(tracker.target)
     }
@@ -87,7 +88,7 @@ final class TransportSwitchTests: XCTestCase {
         var tracker = TransportSwitchTracker()
         tracker.streamResumed(now: t0)                 // ordinary first connect
         tracker.linkLost(lastTransport: "USB", hadFrames: true, now: at(10))
-        XCTAssertEqual(tracker.target, .wifi)
+        XCTAssertEqual(tracker.target, .usbLost)
         XCTAssertFalse(tracker.tick(now: at(20)) && tracker.target != nil)
     }
 
