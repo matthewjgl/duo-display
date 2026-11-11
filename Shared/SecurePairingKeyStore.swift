@@ -31,13 +31,15 @@ enum SecurePairingKeyStore {
     }
 
     private static func remember(_ peer: String) {
+        TrustedPeerRegistry.approvedAgain(peer)
         var peers = Set(UserDefaults.standard.stringArray(forKey: "duo.securePeers.v1") ?? [])
         peers.insert(peer)
         UserDefaults.standard.set(Array(peers), forKey: "duo.securePeers.v1")
-        NotificationCenter.default.post(name: .init("DuoPairSaved"), object: nil)
+        NotificationCenter.default.post(name: .init("DuoPairSaved"), object: peer)
     }
 
     static func load(peerID: String) throws -> SymmetricKey? {
+        guard !TrustedPeerRegistry.isRevoked(peerID) else { return nil }
         var item = try query(peerID: peerID)
         item[kSecReturnData as String] = true
         item[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -50,6 +52,9 @@ enum SecurePairingKeyStore {
     }
 
     static func remove(peerID: String) throws {
+        // Tombstone first: failure to erase a Keychain item must fail closed.
+        TrustedPeerRegistry.markRevoked(peerID)
+        NotificationCenter.default.post(name: .init("DuoPairRevoked"), object: peerID)
         let status = SecItemDelete(try query(peerID: peerID) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw StoreError.keychain(status) }
     }

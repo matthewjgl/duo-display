@@ -172,7 +172,11 @@ targets:
       - Shared/SecurePairingKeyStore.swift
       - Shared/PairingApprovalCoordinator.swift
       - Shared/PairingExchange.swift
+      - Shared/BonjourBrowser.swift
+      - Shared/PairingDiscovery.swift
       - Shared/TrustedConnections.swift
+      - Shared/TrustedPeerRegistry.swift
+      - Shared/TrustedSessionRouting.swift
       - Shared/StreamReceiver.swift
       - Shared/AppStore.swift
       - Shared/ConnectionHealth.swift

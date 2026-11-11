@@ -224,6 +224,9 @@ struct ReceiverScreen: View {
                 model.sceneDidActivate()
                 // The user may have renamed the device in Settings meanwhile.
                 model.refreshAnnouncedName()
+                PairingDiscovery.shared.recover()
+                TrustedConnections.shared.browse(receiver: model.receiver)
+                TrustedConnections.shared.recoverAfterEnvironmentChange()
             case .background: model.sceneDidBackground()
             default: break
             }
@@ -411,17 +414,29 @@ struct IdleView: View {
     private var pairing: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Your Macs").font(.headline)
-                ForEach(trusted.macs, id: \.endpoint) { mac in
-                    Button("Connect to \(trusted.name(mac))") { trusted.connect(mac) }
-                        .disabled(trusted.connecting || receiver.connected)
+                Text("Trusted Macs").font(.headline)
+                Text("Your approved Macs stay here. Everyday Connect does not use the first-time pairing window.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                ForEach(trusted.rememberedPeers) { peer in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(peer.name).font(.headline)
+                        Text(trusted.availabilityLabel(for: peer.id)).font(.footnote).foregroundStyle(.secondary)
+                        HStack {
+                            Button("Connect") { trusted.connectPeer(peer.id) }
+                                .disabled(!trusted.canConnect(to: peer.id) || receiver.connected)
+                            Button("Forget Mac", role: .destructive) { trusted.revoke(peer.id) }
+                        }
+                    }
                 }
+                Button("Refresh Macs") { trusted.retryBrowse(receiver: receiver) }
+                Text("A sleeping Mac, a quit app, a locked session or blocked Local Network access may prevent connection. Duo Display cannot wake or unlock your Mac.")
+                    .font(.footnote).foregroundStyle(.secondary)
                 Text(trusted.status).font(.footnote)
                 if trusted.connecting { Button("Cancel") { trusted.cancel() } }
-            }.onAppear { trusted.browse(receiver: receiver) }
+            }.onAppear { trusted.browse(receiver: receiver); pairingDiscovery.browse() }
             VStack(alignment: .leading, spacing: 10) {
-                Text("Pair with your Mac").font(.headline)
-                Text("On your Mac, choose Pair a phone. Then confirm the code on both devices.")
+                Text("First-time pairing").font(.headline)
+                Text("Keep Duo Display open on your awake Mac and select it below. Confirm the matching code on both screens. Mac 1.0.3 (6) requires Pair a phone first; its window lasts 60 seconds. A USB cable alone does not open pairing.")
                     .font(.footnote).foregroundStyle(.secondary)
                 ForEach(pairingDiscovery.macs, id: \.endpoint) { mac in
                     if case .service(let name, _, _, _) = mac.endpoint {
@@ -431,7 +446,19 @@ struct IdleView: View {
                     }
                 }
                 Text(pairingDiscovery.status).font(.footnote)
-                Button("Find Macs") { pairingDiscovery.browse() }
+                Button("Find a new Mac for pairing") {
+                    pairingDiscovery.browse()
+                    trusted.retryBrowse(receiver: receiver)
+                }
+                DisclosureGroup("Discovery diagnostics") {
+                    Text(receiver.discoveryDiagnostic).font(.caption.monospaced())
+                    Text(pairingDiscovery.diagnostics).font(.caption.monospaced())
+                    Text("Discovery uses the local network. Enable Duo Display in Settings → Privacy & Security → Local Network if access was denied.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Button("Open Duo Display settings") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                    }
+                }
             }
             Picker("Connection instructions", selection: $connectionHelp) {
                 Text("USB").tag(0)
@@ -471,7 +498,7 @@ struct IdleView: View {
                     Button("Open app settings") {
                         if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
                     }
-                    Button("Retry discovery") { receiver.ensureListening() }
+                    Button("Retry discovery") { receiver.retryDiscovery(); pairingDiscovery.browse(); trusted.retryBrowse(receiver: receiver) }
                 }.padding(16).background(RoundedRectangle(cornerRadius: 16).fill(Color(.secondarySystemBackground)))
             }
             Label("Keep Duo Display open while using your second screen.", systemImage: "display")
@@ -620,6 +647,7 @@ struct OnboardingView: View {
 // MARK: - Settings / help sheet
 
 struct SettingsView: View {
+    @ObservedObject private var trusted = TrustedConnections.shared
     @ObservedObject var receiver: StreamReceiver
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
@@ -673,6 +701,16 @@ struct SettingsView: View {
                     .accessibilityValue(receiver.status)
                     if receiver.pairedSession {
                         Button("Disconnect from Mac") { receiver.disconnectPairedStream() }
+                    }
+                    DisclosureGroup("Trusted Macs") {
+                        ForEach(trusted.rememberedPeers) { peer in
+                            HStack {
+                                Text(peer.name)
+                                Spacer()
+                                Button("Revoke", role: .destructive) { trusted.revoke(peer.id) }
+                            }
+                        }
+                        Text("Revoking removes this device’s saved key and ends its paired Wi-Fi session. A new matching-code approval is required to pair again.").font(.footnote)
                     }
                     if receiver.connected && receiver.videoSize != .zero {
                         LabeledRow("Resolution", value: "\(Int(receiver.videoSize.width)) × \(Int(receiver.videoSize.height))")

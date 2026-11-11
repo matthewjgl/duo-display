@@ -70,3 +70,24 @@ struct PerformanceHealth {
         elevated = highLatencySamples >= 5 && now.timeIntervalSince(firstHighAt!) >= 4
     }
 }
+
+/// Empty Bonjour results cannot identify a permission failure or remote version.
+/// Give prerequisites as checks, and reserve a denial diagnosis for PolicyDenied.
+enum DiscoveryGuidance {
+    static func isPolicyDenied(_ error: NWError) -> Bool {
+        if case .dns(let code) = error { return code == kDNSServiceErr_PolicyDenied }
+        return false
+    }
+    static let searching = "Looking for nearby Macs. Keep both apps open on the same local network. New pairing requires matching-code approval on both devices. Older Mac 1.0.3 (6) requires Pair a phone to open its 60-second window."
+    static let noPairableMac = "No Mac is currently advertising pairing. Check that the running Mac app is Duo Display 1.0.3 (6) or later, then choose Pair a phone and tap Find Macs again. Both apps need Local Network access on the same local network. A USB cable alone does not advertise a Mac. If already paired, use Your Macs instead. Guest Wi-Fi or a VPN may block discovery; an empty list alone does not prove permission was denied."
+    static let noTrustedMac = "No trusted Mac is currently reachable. Your remembered pairings are kept. The Mac must be awake, unlocked, running Duo Display with trusted-phone connections enabled. Check Local Network access and the same local network. Revocation or guest-network/VPN isolation are possible causes. First-time pairing is needed only for a new or revoked relationship."
+    static func failure(_ error: NWError, on platform: ConnectionGuidance.DiscoveryPlatform) -> String {
+        let guidance = ConnectionGuidance.discoveryError(error, on: platform)
+        return guidance.finding + " " + guidance.action + " Then retry discovery."
+    }
+    static func localVersion(_ info: [String: Any] = Bundle.main.infoDictionary ?? [:]) -> String {
+        let version = info["CFBundleShortVersionString"] as? String ?? "unknown"
+        let build = info["CFBundleVersion"] as? String ?? "unknown"
+        return "\(version) (\(build))"
+    }
+}

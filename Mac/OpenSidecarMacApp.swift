@@ -129,6 +129,8 @@ final class DeviceSession: ObservableObject, Identifiable {
     /// resolved name exists: the UI shows `displayName`.
     let name: String
     let sender: MacSender
+    var phoneInitiated = false
+    var pairedPeerID: String?
     /// The resolved per-device name (custom, else automatic). Updated in
     /// place by a rename: label only, the stream is untouched.
     @Published var displayName: String
@@ -271,6 +273,8 @@ final class SenderController: ObservableObject {
 
     @Published var sessions: [DeviceSession] = []
     @Published var discovered: [NWBrowser.Result] = []
+    private var trustedLifecycleObservers: [NSObjectProtocol] = []
+    private var trustedSessionUnavailable = false
     private var pairedRoutes: [String: (peer: String, endpoint: NWEndpoint)] = [:]
     // Every cabled device: usbmuxd's iPhones and iPads plus Android devices
     // in accessory mode (udid `aoa:<serial>`). The connection policy treats
@@ -332,6 +336,7 @@ final class SenderController: ObservableObject {
         if compact != menuBarCompact { menuBarCompact = compact }
     }
 
+    @Published private(set) var discoveryDiagnostic = "Starting receiver discovery"
     @Published var discoveryGuidance: ConnectionGuidance?
     @Published var lastConnectionGuidance: ConnectionGuidance?
 
@@ -343,7 +348,7 @@ final class SenderController: ObservableObject {
 
     private var usbProbes: [String: UUID] = [:]
     private var usbProbeAttempted: Set<String> = []
-    private var browser: NWBrowser?
+    private var browser: BonjourBrowser?
     private var usbWatcher: UsbmuxDeviceWatcher?
     private var accessoryWatcher: AccessoryDeviceWatcher?
 
@@ -428,7 +433,14 @@ final class SenderController: ObservableObject {
             Task { @MainActor in self?.refreshMenuBarReadout() }
         }
         startBrowsing()
-        TrustedConnections.shared.serve(name: Host.current().localizedName ?? "Mac") { [weak self] peer, receiverID, endpoint in
+        PairingDiscovery.shared.onApprovalNeeded = { MainWindow.show() }
+        PairingDiscovery.shared.advertise(name: Host.current().localizedName ?? "Mac", persistent: true)
+        TrustedConnections.shared.serve(name: Host.current().localizedName ?? "Mac", availability: { [weak self] in
+            guard let self, !self.trustedSessionUnavailable else { return "Mac session unavailable. Wake and unlock the Mac before connecting." }
+            guard CGPreflightScreenCaptureAccess() else { return "On the Mac, enable Screen Recording for Duo Display, then reopen it." }
+            guard InputInjector.hasInputControlPermission else { return "On the Mac, enable input control for Duo Display, then reopen it." }
+            return nil
+        }) { [weak self] peer, receiverID, endpoint in
             guard let self else { return "Mac unavailable." }
             guard CGPreflightScreenCaptureAccess() else { return "On the Mac, enable Duo Display in Privacy & Security → Screen Recording, then reopen it." }
             guard InputInjector.hasInputControlPermission else { return "On the Mac, enable Duo Display input control in Privacy & Security, then reopen it." }
@@ -439,12 +451,40 @@ final class SenderController: ObservableObject {
             UserDefaults.standard.set(bindings, forKey: "duo.receiverPairBindings.v1")
             if let session = self.activeSession(coveringWiFi: result), !session.failed {
                 if session.onUSB { return "This device is streaming over USB. Unplug before requesting Wi-Fi." }
-                if session.sender.requiredPairedPeer?.peerID == peer, !session.transportPending { return nil }
+                if TrustedSessionRouting.canReuse(peer: peer, existingPeer: session.pairedPeerID,
+                    pending: session.transportPending, existingEndpoint: self.pairedRoutes[receiverID]?.endpoint,
+                    requestedEndpoint: endpoint) { return nil }
                 self.end(session)
             }
-            self.connect(to: .wifi(result), paired: (peer, endpoint))
+            self.connect(to: .wifi(result), userInitiated: true, paired: (peer, endpoint), phoneInitiated: true)
             return nil
         }
+        TrustedConnections.shared.onRevoked = { [weak self] peer in
+            guard let self else { return }
+            // Keep USB (OS-trusted cable) intact. Existing Wi-Fi sessions lose access.
+            for session in self.sessions where !session.onUSB && session.pairedPeerID == peer {
+                self.end(session)
+            }
+        }
+        TrustedConnections.shared.onDisabled = { [weak self] in
+            guard let self else { return }
+            for session in self.sessions where session.phoneInitiated && !session.onUSB { self.end(session) }
+        }
+        let workspace = NSWorkspace.shared.notificationCenter
+        trustedLifecycleObservers.append(workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
+            Task { @MainActor in TrustedConnections.shared.suspendForSleep() }
+        })
+        for event in [NSWorkspace.didWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            trustedLifecycleObservers.append(workspace.addObserver(forName: event, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.trustedSessionUnavailable = false; self?.browser?.recover(); PairingDiscovery.shared.recover(); TrustedConnections.shared.resumeAfterWake() }
+            })
+        }
+        trustedLifecycleObservers.append(workspace.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.trustedSessionUnavailable = true; TrustedConnections.shared.recoverAfterEnvironmentChange() }
+        })
+        trustedLifecycleObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.browser?.recover(); PairingDiscovery.shared.recover(); TrustedConnections.shared.recoverAfterEnvironmentChange() }
+        })
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             self?.usbmuxDevices = devices
             self?.wiredDevicesChanged()
@@ -462,11 +502,14 @@ final class SenderController: ObservableObject {
 
     private func startBrowsing() {
         // TXT records carry the receiver's install id (new receivers).
-        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil), using: .tcp)
-        browser.browseResultsChangedHandler = { [weak self, weak browser] results, _ in
+        browser?.cancel()
+        let browser = BonjourBrowser(type: "_opensidecar._tcp")
+        browser.onResults = { [weak self, weak browser] results in
             DispatchQueue.main.async {
                 guard let self, let browser, self.browser === browser else { return }
                 self.discovered = Array(results)
+                self.discoveryDiagnostic = "Receiver browser: \(results.count) services (_opensidecar._tcp / local.)"
+                Log.info("discovery: receiver browser results=\(results.count)")
                 self.recordAdvertisedNames()
                 self.endSessionsWhoseServiceVanished()
                 // A cable pulled before the device's Wi-Fi service was seen
@@ -476,9 +519,11 @@ final class SenderController: ObservableObject {
                 self.connectNewlyCabled()
             }
         }
-        browser.stateUpdateHandler = { [weak self, weak browser] state in
+        browser.onState = { [weak self, weak browser] state in
             Task { @MainActor in
                 guard let self, let browser, self.browser === browser else { return }
+                self.discoveryDiagnostic = browser.diagnostic
+                Log.info("discovery: browser \(state)")
                 switch state {
                 case .ready: self.discoveryGuidance = nil
                 case .waiting(let error), .failed(let error):
@@ -488,7 +533,7 @@ final class SenderController: ObservableObject {
             }
         }
         self.browser = browser
-        browser.start(queue: .main)
+        browser.start()
     }
 
     // MARK: - Physical-device identity
@@ -884,7 +929,7 @@ final class SenderController: ObservableObject {
 
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
                  awaitingWake: Bool = false,
-                 paired: (peer: String, endpoint: NWEndpoint)? = nil) {
+                 paired: (peer: String, endpoint: NWEndpoint)? = nil, phoneInitiated: Bool = false) {
         let paired: (peer: String, endpoint: NWEndpoint)? = {
             if let paired {
                 if case .wifi(let result) = target, let receiverID = txtID(of: result) { pairedRoutes[receiverID] = paired }
@@ -982,6 +1027,8 @@ final class SenderController: ObservableObject {
             sender.pairedWiFiEndpoint = PairedTransport.endpoint(mac: PairingApprovalCoordinator.localID, phone: paired.peer)
         }
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
+        session.phoneInitiated = phoneInitiated
+        session.pairedPeerID = paired?.peer
         session.selectedQuality = selectedQuality
         let initialName = resolvedName(key: DeviceNameKey.make(installID: knownID, udid: usbUDID),
                                        live: liveNames(udid: usbUDID, wifi: wifiResult(of: target),
@@ -1028,6 +1075,7 @@ final class SenderController: ObservableObject {
             if case .usb(let udid?) = session.target, let installID = info.id {
                 self.installIDByUDID[udid] = installID
                 if let peer = (UserDefaults.standard.dictionary(forKey: "duo.receiverPairBindings.v1") as? [String: String])?[installID] {
+                    session.pairedPeerID = peer
                     session.sender.configurePairedPeer(peerID: peer,
                         identity: PairedTransport.identity(PairingApprovalCoordinator.localID, peer),
                         endpoint: PairedTransport.endpoint(mac: PairingApprovalCoordinator.localID, phone: peer))
@@ -1308,10 +1356,10 @@ final class SenderController: ObservableObject {
     /// Mode/quality apply per-pipeline at construction — rebuild every session.
     func restartAll() {
         guard running else { return }
-        let targets = sessions.map(\.target)
-        sessions.forEach { $0.sender.stop() }
-        sessions.removeAll()
-        targets.forEach { connect(to: $0) }
+        let restarting = sessions
+        let targets = restarting.map { ($0.target, $0.phoneInitiated) }
+        restarting.forEach { end($0) } // also cancels pending start tasks
+        targets.forEach { connect(to: $0.0, phoneInitiated: $0.1) }
         autoConnect()   // a rebuilt WiFi session may deserve its cable back
     }
 
@@ -1516,6 +1564,8 @@ final class PermissionMonitor: ObservableObject {
 
 struct ContentView: View {
     @ObservedObject var controller: SenderController
+    @ObservedObject private var pairingDiscovery = PairingDiscovery.shared
+    @ObservedObject private var trustedConnections = TrustedConnections.shared
     @StateObject private var permissions = PermissionMonitor()
     // Retained for the future signed Duo Display update integration.
     let updater: SPUStandardUpdaterController?
@@ -1544,7 +1594,7 @@ struct ContentView: View {
                     Spacer()
                     if page == .devices {
                         Button("Pair a phone") {
-                            PairingDiscovery.shared.advertise(name: Host.current().localizedName ?? "Mac")
+                            PairingDiscovery.shared.advertise(name: Host.current().localizedName ?? "Mac", persistent: true)
                         }
                         Button(action: arrangeDisplays) {
                             Label("Arrange Displays…", systemImage: "rectangle.3.group")
@@ -1553,6 +1603,20 @@ struct ContentView: View {
                     }
                 }
                 .padding(.horizontal, 28).padding(.top, 26).padding(.bottom, 20)
+                if page == .devices, !pairingDiscovery.status.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label(pairingDiscovery.status, systemImage: pairingDiscovery.isAdvertising ? "antenna.radiowaves.left.and.right" : "info.circle")
+                            .font(.callout).fixedSize(horizontal: false, vertical: true)
+                        DisclosureGroup("Pairing diagnostics") {
+                            Text(controller.discoveryDiagnostic).font(.caption.monospaced())
+                            Text(pairingDiscovery.diagnostics).font(.caption.monospaced())
+                            Text(trustedConnections.serverStatus).font(.caption)
+                        }
+                        if pairingDiscovery.isAdvertising {
+                            Button("Close pairing window") { pairingDiscovery.stop() }
+                        }
+                    }.padding(.horizontal, 28).padding(.bottom, 12)
+                }
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
                         switch page {
@@ -1795,6 +1859,21 @@ struct ContentView: View {
     }
 
     private var appPage: some View {
+        VStack(alignment: .leading, spacing: 20) {
+        DuoMacCard("Trusted phones", symbol: "lock.shield") {
+            Toggle("Allow paired phones to connect over Wi-Fi", isOn: $trustedConnections.allowTrustedPhones)
+            Text("After one matching-code approval, trusted phones can connect while this Mac is awake, unlocked, running Duo Display and has capture/control permissions. No Pair a phone click is needed again. Turning this off closes phone-initiated Wi-Fi sessions; USB and Mac-initiated connections remain available.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text(trustedConnections.serverStatus).font(.callout)
+            ForEach(trustedConnections.rememberedPeers) { peer in
+                HStack {
+                    Text(peer.name)
+                    Spacer()
+                    Button("Revoke access", role: .destructive) { trustedConnections.revoke(peer.id) }
+                }
+            }
+            Button("Refresh trusted connections") { trustedConnections.recoverAfterEnvironmentChange() }
+        }
         DuoMacCard("Make it yours", symbol: "slider.horizontal.3") {
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle("Auto-connect when a cable is plugged in", isOn: $controller.autoConnectOnCable)
@@ -1824,6 +1903,7 @@ struct ContentView: View {
                 }
 
 
+        }
         }
     }
 

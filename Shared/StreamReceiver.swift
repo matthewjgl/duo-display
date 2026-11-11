@@ -147,12 +147,15 @@ final class StreamReceiver: ObservableObject {
         guard let key = try SecurePairingKeyStore.load(peerID: peerID) else {
             throw SecurePairingKeyStore.StoreError.invalidPeer
         }
-        try startPairedStream(key: key, identity: identity, onReady: nil)
+        try startPairedStream(key: key, identity: identity, onReady: nil, authorize: {
+            guard let current = try? SecurePairingKeyStore.load(peerID: peerID) else { return false }
+            return TrustedConnections.sameKey(current, key)
+        })
     }
 
     /// Injecting a key is internal-only for the local receiver integration test.
     func startPairedStream(key: SymmetricKey, identity: String,
-                           onReady: ((NWEndpoint.Port) -> Void)?) throws {
+                           onReady: ((NWEndpoint.Port) -> Void)?, authorize: @escaping () -> Bool = { true }) throws {
         let secure = try NWListener(using: PairedTransport.parameters(key: key, identity: identity))
         secure.service = NWListener.Service(name: PairedTransport.streamService(identity), type: PairedTransport.serviceType)
         let fingerprint = key.withUnsafeBytes { Data(SHA256.hash(data: Data($0))) }
@@ -178,6 +181,7 @@ final class StreamReceiver: ObservableObject {
                 candidate.stateUpdateHandler = { [weak self, weak secure] state in
                     guard let self, let secure, self.pairedListener === secure else { candidate.cancel(); return }
                     if case .ready = state {
+                        guard authorize() else { candidate.cancel(); self.pendingPairedConnections.removeAll { $0 === candidate }; return }
                         guard self.pendingPairedConnections.contains(where: { $0 === candidate }) else {
                             candidate.cancel(); return
                         }
@@ -213,6 +217,16 @@ final class StreamReceiver: ObservableObject {
     }
 
     private var listenerHealthy = false
+    private var discoveryActive = false
+    private var closingSession = false
+    private var resumeDiscoveryAfterClose = false
+    private var discoveryPath: NWPathMonitor?
+    private var discoveryRetry: DispatchWorkItem?
+    private var discoveryRetryCount = 0
+    private var discoveryPolicyDenied = false
+    @Published private(set) var discoveryDiagnostic = "Not listening"
+    private var advertisementRegistered = false
+
     private var connection: NWConnection?
     // Cursor side channel: UDP on port+1. Cursor positions ride TCP behind
     // multi-hundred-KB video frames, so over WiFi one late frame stalls the
@@ -546,6 +560,8 @@ final class StreamReceiver: ObservableObject {
         #endif
         self.port = port
         queue.async {
+            self.discoveryActive = true
+            self.watchDiscoveryPath()
             self.startListener()
             if let mac = UserDefaults.standard.string(forKey: "duo.selectedPairedMac"),
                let own = UserDefaults.standard.string(forKey: "duo.securePairing.localID.v1") {
@@ -562,6 +578,9 @@ final class StreamReceiver: ObservableObject {
     /// instance is discarded afterwards (start() re-arms if it isn't).
     func stop(completion: (() -> Void)? = nil) {
         queue.async {
+            self.discoveryActive = false
+            self.discoveryRetry?.cancel(); self.discoveryRetry = nil
+            self.discoveryPath?.cancel(); self.discoveryPath = nil
             self.pingTimer?.cancel(); self.pingTimer = nil
             self.watchdogTimer?.cancel(); self.watchdogTimer = nil
             self.addrWatchTimer?.cancel(); self.addrWatchTimer = nil
@@ -584,10 +603,48 @@ final class StreamReceiver: ObservableObject {
         if debugOffline { return }
         #endif
         queue.async {
-            guard !self.listenerHealthy else { return }
+            if self.closingSession { self.resumeDiscoveryAfterClose = true; return }
+            self.discoveryActive = true
+            self.watchDiscoveryPath()
+            guard !self.listenerHealthy || !self.advertisementRegistered else { return }
             Log.info("listener not healthy — restarting")
             self.restartListener()
         }
+    }
+
+    /// Re-register Bonjour without closing the live stream, virtual display or input.
+    func retryDiscovery() {
+        queue.async {
+            if self.closingSession { self.resumeDiscoveryAfterClose = true; return }
+            self.discoveryActive = true
+            self.watchDiscoveryPath()
+            self.restartListener()
+        }
+    }
+
+    private func watchDiscoveryPath() {
+        guard discoveryPath == nil else { return }
+        let monitor = NWPathMonitor(); discoveryPath = monitor
+        var initial = true
+        monitor.pathUpdateHandler = { [weak self] _ in
+            if initial { initial = false; return }
+            guard let self, self.discoveryActive else { return }
+            self.discoveryPolicyDenied = false
+            self.scheduleDiscoveryRetry(delay: 0.5)
+        }
+        monitor.start(queue: queue)
+    }
+
+    private func scheduleDiscoveryRetry(delay: TimeInterval? = nil) {
+        guard discoveryActive, !discoveryPolicyDenied, discoveryRetry == nil else { return }
+        discoveryRetryCount = min(discoveryRetryCount + 1, 5)
+        let wait = delay ?? min(32, pow(2, Double(discoveryRetryCount)))
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.discoveryActive else { return }
+            self.discoveryRetry = nil; self.restartListener()
+        }
+        discoveryRetry = work
+        queue.asyncAfter(deadline: .now() + wait, execute: work)
     }
 
     // Set while the app lingers in the background with the session alive
@@ -635,18 +692,27 @@ final class StreamReceiver: ObservableObject {
     private func closeSession(announcing type: String, status: String,
                               completion: (() -> Void)?) {
         queue.async {
+            self.closingSession = true
             var finished = false
             let finish = { [weak self] in
                 guard let self, !finished else { return }
                 finished = true
                 self.connection?.cancel()
                 self.connection = nil
+                self.discoveryActive = false
+                self.discoveryRetry?.cancel(); self.discoveryRetry = nil
                 self.listener?.cancel()
                 self.listener = nil
                 self.listenerHealthy = false
                 self.stopCursorListener()
                 self.setConnected(false, deliberate: true)
                 self.setStatus(status)
+                self.closingSession = false
+                if self.resumeDiscoveryAfterClose {
+                    self.resumeDiscoveryAfterClose = false
+                    self.discoveryActive = true
+                    self.restartListener()
+                }
                 completion?()
             }
             guard let conn = self.connection, conn.state == .ready else {
@@ -665,9 +731,11 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func restartListener() {
-        listener?.cancel()
-        listener = nil
-        listenerHealthy = false
+        guard discoveryActive else { return }
+        discoveryRetry?.cancel(); discoveryRetry = nil
+        let retired = listener; listener = nil; retired?.cancel()
+        listenerHealthy = false; advertisementRegistered = false
+        discoveryPolicyDenied = false
         startListener()
     }
 
@@ -782,6 +850,7 @@ final class StreamReceiver: ObservableObject {
         #if DEBUG
         if debugOffline { return }   // harness: never reachable by a real Mac
         #endif
+        guard discoveryActive, listener == nil else { return }
         do {
             // noDelay matters most in THIS direction: touch events are tiny
             // packets, and Nagle would hold each one until the previous is
@@ -794,13 +863,32 @@ final class StreamReceiver: ObservableObject {
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         } catch {
             setStatus("Listener failed: \(error.localizedDescription)")
+            scheduleDiscoveryRetry()
             return
         }
         // Advertise on the local network so the Mac can discover us for WiFi
         // mode (USB/usbmux connects straight to the port and ignores this).
-        listener?.service = advertisedService
-        listener?.newConnectionHandler = { [weak self] conn in
-            guard let self else { return }
+        guard let current = listener else { return }
+        current.service = advertisedService
+        current.serviceRegistrationUpdateHandler = { [weak self, weak current] change in
+            guard let self, let current, self.listener === current, self.discoveryActive else { return }
+            switch change {
+            case .add:
+                self.advertisementRegistered = true
+                self.discoveryRetryCount = 0
+                self.discoveryRetry?.cancel(); self.discoveryRetry = nil
+                Log.info("discovery: receiver Bonjour registered (_opensidecar._tcp / local.)")
+                DispatchQueue.main.async { self.discoveryDiagnostic = "Receiver Bonjour registered (_opensidecar._tcp / local.)"; self.networkGuidance = nil }
+            case .remove:
+                self.advertisementRegistered = false
+                Log.info("discovery: receiver Bonjour removed; recovering")
+                DispatchQueue.main.async { self.discoveryDiagnostic = "Receiver advertisement lost; recovering" }
+                self.scheduleDiscoveryRetry()
+            @unknown default: break
+            }
+        }
+        current.newConnectionHandler = { [weak self, weak current] conn in
+            guard let self, let current, self.listener === current, self.discoveryActive else { conn.cancel(); return }
             Log.info("new connection from \(String(describing: conn.endpoint))")
             // usbmux-forwarded (cable) connections arrive from loopback;
             // anything else came over the network.
@@ -851,8 +939,11 @@ final class StreamReceiver: ObservableObject {
                 self.adopt(conn)
             }
         }
-        listener?.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+        current.stateUpdateHandler = { [weak self, weak current] state in
+            guard let self, let current, self.listener === current, self.discoveryActive else { return }
+            Log.info("discovery: receiver listener \(state)")
+            let registered = self.advertisementRegistered
+            DispatchQueue.main.async { self.discoveryDiagnostic = "Receiver listener: \(state); Bonjour registered: \(registered)" }
             switch state {
             case .ready:
                 self.listenerHealthy = true
@@ -861,26 +952,36 @@ final class StreamReceiver: ObservableObject {
             case .waiting(let error):
                 self.listenerHealthy = false
                 DispatchQueue.main.async { self.networkGuidance = .discoveryError(error, on: .phone) }
+                self.discoveryPolicyDenied = DiscoveryGuidance.isPolicyDenied(error)
+                if !self.discoveryPolicyDenied { self.scheduleDiscoveryRetry() }
             case .failed(let error):
                 DispatchQueue.main.async { self.networkGuidance = .discoveryError(error, on: .phone) }
                 if case .dns(let code) = error, code == kDNSServiceErr_PolicyDenied {
                     self.listenerHealthy = false
+                    self.discoveryPolicyDenied = true
                     self.setStatus("Local Network access is needed for Wi-Fi discovery")
                     // Permission changes are retried on foreground or the
                     // explicit retry action, not in a one-second failure loop.
                     return
                 }
-                Log.info("listener failed: \(error) — restarting in 1s")
+                Log.info("listener failed: \(error) — retrying with bounded backoff")
                 self.listenerHealthy = false
                 self.setStatus("Listener failed — restarting…")
-                self.queue.asyncAfter(deadline: .now() + 1) { self.restartListener() }
+                self.scheduleDiscoveryRetry()
             case .cancelled:
                 self.listenerHealthy = false
             default: break
             }
         }
-        listener?.start(queue: queue)
-        startCursorListener()
+        current.start(queue: queue)
+        // A ready TCP socket does not prove multicast registration succeeded.
+        let registrationCheck = DispatchWorkItem { [weak self, weak current] in
+            guard let self, let current, self.listener === current, self.discoveryActive, !self.advertisementRegistered, !self.discoveryPolicyDenied else { return }
+            DispatchQueue.main.async { self.discoveryDiagnostic = "Listener available, Bonjour registration pending; recovering. Check Local Network access if this persists." }
+            self.scheduleDiscoveryRetry()
+        }
+        queue.asyncAfter(deadline: .now() + 10, execute: registrationCheck)
+        if cursorListener == nil { startCursorListener() }
     }
 
     /// Make `conn` the session: replace any existing connection and reset

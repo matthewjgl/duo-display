@@ -87,6 +87,7 @@ final class PairingApprovalCoordinator: ObservableObject {
         guard localApproved, remoteApproved, let prompt, let key, now < deadline else { return }
         do {
             try save(key, prompt.peerID)
+            TrustedPeerRegistry.rememberName(prompt.name, peer: prompt.peerID)
             let peer = prompt.peerID
             timeout?.cancel(); timeout = nil
             self.prompt = nil; self.key = nil

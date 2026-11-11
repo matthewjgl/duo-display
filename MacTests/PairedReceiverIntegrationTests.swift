@@ -4,6 +4,30 @@ import Network
 import AVFoundation
 
 final class PairedReceiverIntegrationTests: XCTestCase {
+    func testRevokedAdmissionClosesEvenCorrectTLSKeyBeforeReceiverHello() async throws {
+        let receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(), deviceKind: "iPhone", fallbackServiceName: "Revoked QA")
+        let key = SymmetricKey(size: .bits256)
+        var port: NWEndpoint.Port?
+        let ready = expectation(description: "listener ready")
+        try receiver.startPairedStream(key: key, identity: "revoked-stream", onReady: { port = $0; ready.fulfill() }, authorize: { false })
+        await fulfillment(of: [ready], timeout: 5)
+        let c = NWConnection(host: "127.0.0.1", port: try XCTUnwrap(port), using: PairedTransport.parameters(key: key, identity: "revoked-stream"))
+        let unauthorizedHello = expectation(description: "revoked peer must receive no hello")
+        unauthorizedHello.isInverted = true
+        c.stateUpdateHandler = { state in
+            if case .ready = state {
+                c.receive(minimumIncompleteLength: 4, maximumLength: 4096) { data,_,_,_ in
+                    if let data, !data.isEmpty { unauthorizedHello.fulfill() }
+                }
+            }
+        }
+        c.start(queue: .main)
+        await fulfillment(of: [unauthorizedHello], timeout: 0.5)
+        c.cancel()
+        let stopped = expectation(description: "stopped"); receiver.stop { stopped.fulfill() }
+        await fulfillment(of: [stopped], timeout: 5)
+    }
+
     func testReadyListenerIsReusedForSamePair() async throws {
         let receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(), deviceKind: "iPhone", fallbackServiceName: "QA")
         let key = SymmetricKey(size: .bits256)
