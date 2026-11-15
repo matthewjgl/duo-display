@@ -61,15 +61,37 @@ def archive_frozen_source(out, source_hashes, destination):
 
 
 def create_disk_image(stage, destination, volume):
-    # Build HFS+ directly without a temporary mounted volume. Folder-image
-    # creation can be vetoed by unrelated Disk Arbitration clients (including
-    # stalled simulator inventory commands). Conversion still produces a normal
-    # compressed UDIF DMG, readable by both supported Mac deployment targets.
+    # Avoid folder-image creation's automatic mount/unmount cycle, which can be
+    # vetoed by unrelated Disk Arbitration clients. Build HFS+ directly, then
+    # inspect a privately mounted writable copy before producing a normal UDIF
+    # compressed DMG readable by both supported Mac deployment targets.
     with tempfile.TemporaryDirectory(prefix='sideextend-image-') as tmp:
         raw = Path(tmp) / 'source.dmg'
         run('hdiutil', 'makehybrid', '-hfs', '-hfs-volume-name', volume,
             '-o', str(raw), str(stage))
-        run('hdiutil', 'convert', str(raw), '-format', 'UDZO', '-o', str(destination))
+        writable = Path(tmp) / 'working.dmg'
+        run('hdiutil', 'convert', str(raw), '-format', 'UDRW', '-o', str(writable))
+        mount = Path(tmp) / 'mounted'
+        mount.mkdir()
+        run('hdiutil', 'attach', '-readwrite', '-nobrowse', '-mountpoint', str(mount), str(writable))
+        try:
+            # The HFS+ builder can synthesize FinderInfo on Mach-O helpers.
+            # Remove only that packaging detritus, never the signature/ticket or
+            # quarantine attributes, then verify the unchanged signed bundle.
+            for app in mount.glob('*.app'):
+                clear_finder_metadata(app)
+                run('codesign', '--verify', '--deep', '--strict', str(app))
+            run('/bin/sync')
+        finally:
+            # Only this private, newly created image is detached. Stale Disk
+            # Arbitration inventory clients must not prevent its cleanup.
+            run('hdiutil', 'detach', '-force', str(mount))
+        run('hdiutil', 'convert', str(writable), '-format', 'UDZO', '-o', str(destination))
+
+
+def clear_finder_metadata(app):
+    # Apple's bundled Python may omit the os extended-attribute functions.
+    run('/usr/bin/xattr', '-dr', 'com.apple.FinderInfo', str(app))
 
 
 def stage_distribution_app(app, stage):

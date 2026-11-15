@@ -3,12 +3,27 @@ from pathlib import Path
 import tempfile
 import unittest
 import zipfile
+import subprocess
 
 spec = importlib.util.spec_from_file_location('release_mac', Path(__file__).with_name('mac.py'))
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 class FeedChecks(unittest.TestCase):
+    def test_finder_cleanup_preserves_contents_and_other_attributes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / 'Example.app'
+            app.mkdir()
+            helper = app / 'helper'
+            helper.write_bytes(b'unchanged signed contents')
+            subprocess.run(['/usr/bin/xattr', '-wx', 'com.apple.FinderInfo', '41' * 32, str(helper)], check=True)
+            subprocess.run(['/usr/bin/xattr', '-w', 'com.example.preserved', 'keep', str(helper)], check=True)
+            release.clear_finder_metadata(app)
+            attrs = subprocess.check_output(['/usr/bin/xattr', str(helper)], text=True)
+            self.assertNotIn('com.apple.FinderInfo', attrs)
+            self.assertIn('com.example.preserved', attrs)
+            self.assertEqual(helper.read_bytes(), b'unchanged signed contents')
+
     def test_packaging_resume_preserves_framework_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
