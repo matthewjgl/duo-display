@@ -1,4 +1,4 @@
-# Duo Display application repository
+# SideExtend application repository
 
 Preserve the existing bundle identifiers, Debug/Release separation, entitlements, signing requirements and wire/discovery identifiers. Legacy protocol identifiers are not user-facing branding. Do not change connection, codec or display behavior during UI work.
 

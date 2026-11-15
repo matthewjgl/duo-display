@@ -60,6 +60,28 @@ def archive_frozen_source(out, source_hashes, destination):
         run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(source), str(destination))
 
 
+def create_disk_image(stage, destination, volume):
+    # Build HFS+ directly without a temporary mounted volume. Folder-image
+    # creation can be vetoed by unrelated Disk Arbitration clients (including
+    # stalled simulator inventory commands). Conversion still produces a normal
+    # compressed UDIF DMG, readable by both supported Mac deployment targets.
+    with tempfile.TemporaryDirectory(prefix='sideextend-image-') as tmp:
+        raw = Path(tmp) / 'source.dmg'
+        run('hdiutil', 'makehybrid', '-hfs', '-hfs-volume-name', volume,
+            '-o', str(raw), str(stage))
+        run('hdiutil', 'convert', str(raw), '-format', 'UDZO', '-o', str(destination))
+
+
+def stage_distribution_app(app, stage):
+    """Resume packaging without merging pre-existing framework symlinks."""
+    target = stage / app.name
+    if target.is_symlink():
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
+    run('ditto', '--rsrc', '--extattr', str(app), str(target))
+
+
 def run(*args, cwd=ROOT, log=None):
     if log:
         with open(log, 'w') as output:
@@ -260,11 +282,11 @@ def finish_notarization(out, profile):
         dmg = out / f'{product.replace(" ", "")}.dmg'
         if not dmg.exists():
             stage.mkdir(exist_ok=True)
-            shutil.copytree(app, stage / app.name, symlinks=True, dirs_exist_ok=True)
+            stage_distribution_app(app, stage)
             if not (stage / 'Applications').is_symlink():
                 (stage / 'Applications').symlink_to('/Applications')
             (stage / 'LICENSE').write_bytes((source / 'LICENSE').read_bytes())
-            run('hdiutil', 'create', '-volname', product, '-srcfolder', str(stage), '-format', 'UDZO', str(dmg))
+            create_disk_image(stage, dmg, product)
             run('codesign', '--sign', IDENTITY, '--timestamp', str(dmg))
         notarize(dmg, out / f'{scheme}-dmg-notary', profile)
         run('xcrun', 'stapler', 'staple', str(dmg))

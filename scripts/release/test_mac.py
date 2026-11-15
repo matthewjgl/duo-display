@@ -9,6 +9,21 @@ release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 class FeedChecks(unittest.TestCase):
+    def test_packaging_resume_preserves_framework_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = root / 'distribution/SideExtend.app'
+            versions = app / 'Contents/Frameworks/Example.framework/Versions'
+            (versions / 'A').mkdir(parents=True)
+            (versions / 'A/binary').write_text('signed bytes')
+            (versions / 'Current').symlink_to('A')
+            stage = root / 'stage'
+            release.stage_distribution_app(app, stage)
+            release.stage_distribution_app(app, stage)
+            copied = stage / app.name / 'Contents/Frameworks/Example.framework/Versions'
+            self.assertTrue((copied / 'Current').is_symlink())
+            self.assertEqual((copied / 'Current/binary').read_text(), 'signed bytes')
+
     def test_source_archive_excludes_unlisted_local_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
