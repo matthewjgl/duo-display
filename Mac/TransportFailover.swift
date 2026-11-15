@@ -1,6 +1,6 @@
 import Foundation
 
-/// The Mac's decision when a USB session's cable may be gone (Duo Display
+/// The Mac's decision when a USB session's cable may be gone (SideExtend
 /// failover). Pure, so it is unit-tested without usbmuxd or Bonjour.
 ///
 /// Unplugging keeps the virtual display, capture and encoder alive and redials

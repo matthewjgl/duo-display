@@ -10,7 +10,11 @@ final class TrustedConnections: ObservableObject {
     static let service = "_duoconnect._tcp"
     @Published private(set) var macs: [NWBrowser.Result] = []
     @Published private(set) var status = ""
+    @Published private(set) var lastFailure: String?
+    @Published private(set) var discoveryFailure: String?
     @Published private(set) var connecting = false
+    @Published private(set) var awaitingPairedMac: String?
+    private var pairedWait: Task<Void, Never>?
     @Published private(set) var serverStatus = "No paired-Mac service started"
     private var listeners: [String: NWListener] = [:]
     private var browser: BonjourBrowser?
@@ -22,6 +26,7 @@ final class TrustedConnections: ObservableObject {
     private var serveName = ""
     private var handler: ((String, String, NWEndpoint) -> String?)?
     private var generation = UUID()
+    @Published private(set) var browserDiagnostic = "Not searching for trusted Macs"
     @Published private(set) var rememberedPeers: [TrustedPeerRegistry.Record] = []
     @Published var allowTrustedPhones: Bool {
         didSet {
@@ -156,6 +161,7 @@ final class TrustedConnections: ObservableObject {
         candidates.forEach { $0.cancel() }; candidates = []
     }
     func shutdown() {
+        awaitingPairedMac = nil; pairedWait?.cancel(); pairedWait = nil
         lifecycleActive = false
         handler = nil
         recovery?.cancel(); retry?.cancel(); pathMonitor?.cancel(); pathMonitor = nil
@@ -168,6 +174,7 @@ final class TrustedConnections: ObservableObject {
         catch { didRevoke(peer); status = "Access revoked locally. Keychain removal failed; unlock and retry removal." }
     }
     private func didRevoke(_ peer: String) {
+        if awaitingPairedMac == peer { awaitingPairedMac = nil; pairedWait?.cancel(); pairedWait = nil }
         refreshRecords(); onRevoked?(peer)
         if selectedMac == peer || preferences.string(forKey: "duo.selectedPairedMac") == peer {
             preferences.removeObject(forKey: "duo.selectedPairedMac")
@@ -271,6 +278,7 @@ final class TrustedConnections: ObservableObject {
         }
     }
 
+    func clearFailure() { lastFailure = nil }
     func retryBrowse(receiver: StreamReceiver) {
         guard !connecting else { return }
         browser?.cancel(); browser = nil; macs = []
@@ -282,7 +290,9 @@ final class TrustedConnections: ObservableObject {
         guard browser == nil else { return }
         let b = BonjourBrowser(type: Self.service)
         browser = b
-        if !connecting && !receiver.connected { status = DiscoveryGuidance.noTrustedMac }
+        if !connecting && !receiver.connected { status = rememberedPeers.isEmpty
+            ? "No trusted Macs saved. Use First-time pairing below; Refresh Macs only searches already approved Macs."
+            : DiscoveryGuidance.noTrustedMac }
         b.onResults = { [weak self, weak b] results in
             Task { @MainActor in
                 guard let self, let b, self.browser === b else { return }
@@ -293,15 +303,23 @@ final class TrustedConnections: ObservableObject {
                     }
                 }
                 self.refreshRecords()
+                self.tryPairedConnection()
                 if !self.connecting && !receiver.connected {
-                    self.status = self.macs.isEmpty ? DiscoveryGuidance.noTrustedMac : "Paired Mac found. Tap Connect; its permissions and availability will be checked securely."
+                    self.status = self.rememberedPeers.isEmpty
+                        ? "No trusted Macs saved. Use First-time pairing below; Refresh Macs only searches already approved Macs."
+                        : (self.macs.isEmpty ? DiscoveryGuidance.noTrustedMac : "Paired Mac found. Tap Connect; its permissions and availability will be checked securely.")
                 }
             }
         }
         b.onState = { [weak self, weak b] state in
             Task { @MainActor in
                 guard let self, let b, self.browser === b else { return }
-                switch state { case .failed(let error), .waiting(let error): self.status = DiscoveryGuidance.failure(error, on: .phone); default: break }
+                self.browserDiagnostic = b.diagnostic
+                switch state {
+                case .failed(let error), .waiting(let error): self.status = DiscoveryGuidance.failure(error, on: .phone); self.discoveryFailure = self.status
+                case .ready: self.discoveryFailure = nil
+                default: break
+                }
             }
         }
         b.start()
@@ -313,8 +331,8 @@ final class TrustedConnections: ObservableObject {
         return "Mac"
     }
     private static func advertisement(_ mac: String, _ phone: String, _ name: String, state: String? = nil) -> Data {
-        if let state { return try! JSONEncoder().encode(["Duo Display discovery v2", mac, phone, name, state]) }
-        return try! JSONEncoder().encode(["Duo Display discovery v1", mac, phone, name])
+        if let state { return try! JSONEncoder().encode(["SideExtend discovery v2", mac, phone, name, state]) }
+        return try! JSONEncoder().encode(["SideExtend discovery v1", mac, phone, name])
     }
     nonisolated static func sameKey(_ a: SymmetricKey, _ b: SymmetricKey) -> Bool {
         let bytes = a.withUnsafeBytes { Data($0) }
@@ -323,7 +341,7 @@ final class TrustedConnections: ObservableObject {
     }
     func result(for peer: String) -> NWBrowser.Result? { macs.first { fields($0)?.mac == peer } }
     func availabilityLabel(for peer: String) -> String {
-        guard let result = result(for: peer) else { return "Unavailable — the Mac may be asleep/offline, trusted connections disabled, or this pairing revoked. It must be awake, unlocked and running Duo Display on this network." }
+        guard let result = result(for: peer) else { return "Unavailable — the Mac may be asleep/offline, trusted connections disabled, or this pairing revoked. It must be awake, unlocked and running SideExtend on this network." }
         if case .bonjour(let txt) = result.metadata, let state = txt["state"] { return state == "ready" ? "Ready to connect" : state }
         return "Available — readiness checked when connecting"
     }
@@ -334,9 +352,43 @@ final class TrustedConnections: ObservableObject {
         _ = result
         return true
     }
-    func connectPeer(_ peer: String) {
-        guard let result = result(for: peer) else { status = availabilityLabel(for: peer); return }
+    /// Called only for the phone's explicit Connect intent after both code approvals.
+    /// Discovery metadata never authorizes the connection: result() validates the
+    /// saved key signature, and connectTrusted performs the encrypted challenge.
+    @discardableResult
+    func connectAfterPairing(_ peer: String, receiver: StreamReceiver) -> Bool {
+        guard !connecting, !receiver.connected else { return false }
+        guard (try? lookup(peer)) != nil else {
+            lastFailure = "Saved pairing key is unavailable. Unlock the phone and try Pair & Connect again."; status = lastFailure!; return false
+        }
+        pairedWait?.cancel()
+        awaitingPairedMac = peer; lastFailure = nil
+        browse(receiver: receiver)
+        status = "Connecting…"
+        tryPairedConnection()
+        guard awaitingPairedMac != nil else { return connecting }
+        pairedWait = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((self?.requestTimeout ?? 15) * 1_000_000_000))
+            guard !Task.isCancelled, let self, self.awaitingPairedMac == peer else { return }
+            self.awaitingPairedMac = nil
+            self.status = "Mac not reachable. Keep both devices on the same Wi-Fi, then retry."
+            self.lastFailure = self.status
+        }
+        return true
+    }
+    private func tryPairedConnection() {
+        guard let peer = awaitingPairedMac, let result = result(for: peer), !connecting else { return }
+        awaitingPairedMac = nil; pairedWait?.cancel(); pairedWait = nil
         connect(result)
+    }
+    @discardableResult
+    func connectPeer(_ peer: String) -> Bool {
+        guard !connecting else { return false }
+        guard let result = result(for: peer) else {
+            lastFailure = "This Mac is no longer available through trusted discovery. Refresh, or choose Pair & Connect to verify the matching codes again."
+            status = lastFailure!; return false
+        }
+        return connect(result)
     }
     private func fields(_ result: NWBrowser.Result) -> (mac: String, phone: String)? {
         guard case .bonjour(let txt) = result.metadata, let mac = txt["mac"], let phone = txt["phone"],
@@ -346,16 +398,23 @@ final class TrustedConnections: ObservableObject {
         return (mac, phone)
     }
 
-    func connect(_ result: NWBrowser.Result) {
-        guard !connecting, macs.contains(result), let peer = fields(result), let receiver else { return }
+    @discardableResult
+    func connect(_ result: NWBrowser.Result) -> Bool {
+        guard !connecting else { return false }
+        guard macs.contains(result), let peer = fields(result), let receiver else {
+            lastFailure = "Discovery changed. Refresh Macs and select the device again."
+            status = lastFailure!; return false
+        }
         connectTrusted(endpoint: result.endpoint, macID: peer.mac, receiver: receiver)
+        return connecting
     }
 
     func connectTrusted(endpoint: NWEndpoint, macID: String, receiver: StreamReceiver) {
         guard !connecting else { return }
         observe(receiver)
+        lastFailure = nil
         do {
-            guard let key = try lookup(macID) else { status = "Pair with this Mac first."; return }
+            guard let key = try lookup(macID) else { lastFailure = "Pair with this Mac first."; status = lastFailure!; return }
             preferences.set(macID, forKey: "duo.selectedPairedMac")
             selectedMac = macID
             connecting = true; status = "Connecting securely…"
@@ -392,7 +451,7 @@ final class TrustedConnections: ObservableObject {
                         } else {
                             switch state {
                             case .failed, .waiting:
-                                Task { @MainActor in self?.fail(token, message: "Mac unreachable or pairing key rejected. Check that it is awake, unlocked and running Duo Display on this network, then retry.") }
+                                Task { @MainActor in self?.fail(token, message: "Mac unreachable or pairing key rejected. Check that it is awake, unlocked and running SideExtend on this network, then retry.") }
                             default: break
                             }
                         }
@@ -416,7 +475,7 @@ final class TrustedConnections: ObservableObject {
             Task { @MainActor in
                 guard let self, receiver.link == link else { return }
                 if link.phase.isStreaming {
-                    self.connecting = false
+                    self.connecting = false; self.lastFailure = nil
                     self.hasStreamed = true
                     self.status = "Connected via " + link.phase.fullLabel
                 } else if link.phase.isInTransition {
@@ -428,12 +487,12 @@ final class TrustedConnections: ObservableObject {
             }
         }
     }
-    func cancel() { fail(generation, message: "Connection cancelled.") }
+    func cancel() { awaitingPairedMac = nil; pairedWait?.cancel(); pairedWait = nil; fail(generation, message: "Connection cancelled."); lastFailure = nil }
     private func fail(_ token: UUID, message: String) {
         guard generation == token else { return }
         generation = UUID(); request?.cancel(); request = nil; hasStreamed = false
         receiver?.disconnectPairedStream(stopListening: true)
-        connecting = false; status = message
+        connecting = false; status = message; lastFailure = message
     }
     enum RequestError: Error { case invalid, closed }
     private static func send(_ object: [String: Any], on c: NWConnection) async throws {

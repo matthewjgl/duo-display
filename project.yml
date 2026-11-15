@@ -57,10 +57,10 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
-        NSLocalNetworkUsageDescription: Duo Display connects to your iPad or iPhone over the local network in WiFi mode.
+        NSLocalNetworkUsageDescription: SideExtend connects to your iPad or iPhone over the local network in WiFi mode.
         NSBonjourServices: ["_opensidecar._tcp", "_duopair._tcp", "_duoconnect._tcp", "_duostream._tcp"]
         LSApplicationCategoryType: public.app-category.utilities
-        # Duo Display feeds are release assets, independent of website deployment.
+        # SideExtend feeds are release assets, independent of website deployment.
         SUFeedURL: https://github.com/matthewjgl/duo-display/releases/latest/download/appcast.xml
         SUPublicEDKey: pAj0T+PDqbB6WnRtzUDlnK+FJcQzJWrjMOX6dIymfUU=
         SUEnableAutomaticChecks: true
@@ -70,8 +70,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.mac
-        PRODUCT_NAME: Duo Display
-        BUNDLE_DISPLAY_NAME: Duo Display
+        PRODUCT_NAME: SideExtend
+        BUNDLE_DISPLAY_NAME: SideExtend
         SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: Mac/OpenSidecarMac.entitlements
@@ -83,11 +83,11 @@ targets:
         # Recording/Accessibility grants every time the binary changes.
         # PRODUCT_NAME (not BUNDLE_DISPLAY_NAME) is what the permission
         # lists show, so the Debug build must override it to appear as its
-        # own row instead of a second, indistinguishable "Duo Display".
+        # own row instead of a second, indistinguishable "SideExtend".
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.mac.debug
           PRODUCT_NAME: Duo Display Dev
-          BUNDLE_DISPLAY_NAME: Duo Display Dev
+          BUNDLE_DISPLAY_NAME: SideExtend Dev
           # Colour-inverted icon so the dev build is obvious in the Dock,
           # cmd-tab and permission lists.
           ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon-Dev
@@ -115,11 +115,11 @@ targets:
         CFBundleDisplayName: $(BUNDLE_DISPLAY_NAME)
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
-        NSLocalNetworkUsageDescription: Duo Display Receiver advertises itself on the local network so another Mac can connect and use this Mac as a display.
+        NSLocalNetworkUsageDescription: SideExtend Receiver advertises itself on the local network so another Mac can connect and use this Mac as a display.
         NSBonjourServices: ["_opensidecar._tcp", "_duopair._tcp", "_duoconnect._tcp", "_duostream._tcp"]
-        NSAppleEventsUsageDescription: Duo Display Receiver shuts this Mac down when the connected Mac asks it to.
+        NSAppleEventsUsageDescription: SideExtend Receiver shuts this Mac down when the connected Mac asks it to.
         LSApplicationCategoryType: public.app-category.utilities
-        # Duo Display feeds are release assets, independent of website deployment.
+        # SideExtend feeds are release assets, independent of website deployment.
         SUFeedURL: https://github.com/matthewjgl/duo-display/releases/latest/download/appcast-receiver.xml
         SUPublicEDKey: pAj0T+PDqbB6WnRtzUDlnK+FJcQzJWrjMOX6dIymfUU=
         SUEnableAutomaticChecks: true
@@ -129,8 +129,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.mac.receiver
-        PRODUCT_NAME: Duo Display Receiver
-        BUNDLE_DISPLAY_NAME: Duo Display Receiver
+        PRODUCT_NAME: SideExtend Receiver
+        BUNDLE_DISPLAY_NAME: SideExtend Receiver
         # Log.swift's file locking helpers live in the C bridging header.
         SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
         ENABLE_HARDENED_RUNTIME: YES
@@ -140,7 +140,7 @@ targets:
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.mac.receiver.debug
           PRODUCT_NAME: Duo Display Receiver Dev
-          BUNDLE_DISPLAY_NAME: Duo Display Receiver Dev
+          BUNDLE_DISPLAY_NAME: SideExtend Receiver Dev
           ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon-Dev
   OpenSidecarMacTests:
     type: bundle.unit-test
@@ -148,6 +148,10 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - MacTests
+      - Mac/InputInjector.swift
+      - Mac/KeyboardFocusMonitor.swift
+      - Mac/PublicDisplayArrangement.swift
+      - iOS/TrackpadSpeedControl.swift
       - Mac/DisplayArrangement.swift
       - Mac/OriginRestore.swift
       - Mac/StreamConfiguration.swift
@@ -164,6 +168,12 @@ targets:
       - Mac/Usbmux.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
+      - Shared/MacConnectionOptions.swift
+      - Shared/RemoteKeyboard.swift
+      - Shared/PhoneDisplayArrangement.swift
+      - Shared/PhoneArrangementPreview.swift
+      - Shared/PhoneUIComponents.swift
+      - Shared/TrackpadInput.swift
       - Shared/Protocol.swift
       - Shared/TransportSwitch.swift
       - Shared/ConnectionIndicator.swift
@@ -171,6 +181,7 @@ targets:
       - Shared/PairedTransport.swift
       - Shared/SecurePairingKeyStore.swift
       - Shared/PairingApprovalCoordinator.swift
+      - Shared/PairingApprovalView.swift
       - Shared/PairingExchange.swift
       - Shared/BonjourBrowser.swift
       - Shared/PairingDiscovery.swift
@@ -178,6 +189,7 @@ targets:
       - Shared/TrustedPeerRegistry.swift
       - Shared/TrustedSessionRouting.swift
       - Shared/StreamReceiver.swift
+      - Shared/IdleFrameDumper.swift
       - Shared/AppStore.swift
       - Shared/ConnectionHealth.swift
       - Shared/ReceiverOrientation.swift
@@ -208,8 +220,8 @@ targets:
     info:
       path: iOS/Info.plist
       properties:
-        CFBundleDisplayName: Duo Display
-        CFBundleName: Duo Display
+        CFBundleDisplayName: SideExtend
+        CFBundleName: SideExtend
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -225,7 +237,7 @@ targets:
         # 27 multitasking); the receiver reports whatever window it gets.
         UIRequiresFullScreen: true
         UIRequiresFullScreenIgnoredStartingWithVersion: "27"
-        NSLocalNetworkUsageDescription: Duo Display advertises itself on the local network so your Mac can connect over WiFi.
+        NSLocalNetworkUsageDescription: SideExtend advertises itself on the local network so your Mac can connect over WiFi.
         NSBonjourServices: ["_opensidecar._tcp", "_duopair._tcp", "_duoconnect._tcp", "_duostream._tcp"]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -235,7 +247,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matthewjgl.duodisplay.ios
-        PRODUCT_NAME: Duo Display
+        PRODUCT_NAME: SideExtend
         PRODUCT_MODULE_NAME: DuoDisplayIOS
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

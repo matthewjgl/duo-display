@@ -37,7 +37,13 @@ struct DuoDisplayPhoneApp: App {
     @UIApplicationDelegateAdaptor(DuoPhoneAppDelegate.self) private var appDelegate
     var body: some Scene {
         WindowGroup {
-            ReceiverScreen().modifier(PairingApprovalPresenter())
+            #if DEBUG
+            if let scene = UserDefaults.standard.string(forKey:"DuoUIPreviewScene") {
+                PhoneUIPreviewHost(scene:scene)
+            } else { ReceiverScreen() }
+            #else
+            ReceiverScreen()
+            #endif
         }
     }
 }
@@ -64,6 +70,10 @@ struct ReceiverScreen: View {
     @AppStorage(ReceiverOrientation.defaultsKey) private var savedOrientation = ReceiverOrientation.automatic.rawValue
     @StateObject private var versionGate = VersionGate()
     @State private var showSettings = false
+    @State private var openKeyboardAfterSettings = false
+    @ObservedObject private var pairingApproval = PairingApprovalCoordinator.shared
+    @State private var showPairingApproval = false
+    @AppStorage(PhoneInputMode.defaultsKey) private var inputMode = PhoneInputMode.touch.rawValue
     @State private var showOnboarding = false
     @State private var nagDismissed = false
     @Environment(\.scenePhase) private var scenePhase
@@ -101,6 +111,7 @@ struct ReceiverScreen: View {
     var body: some View {
         AdaptiveNavigation {
             receiverContent
+                .onAppear { model.receiver.inputFeedback = { feedback in DispatchQueue.main.async { PhoneHaptics.emit(feedback) } } }
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
                         Button { showSettings = true } label: {
@@ -110,7 +121,7 @@ struct ReceiverScreen: View {
                         .accessibilityHint("Adjust your display, video and touch settings")
                     }
                 }
-                .navigationTitle(isStreaming ? "" : "Duo Display")
+                .navigationTitle(isStreaming ? "" : "SideExtend")
                 .navigationBarTitleDisplayMode(.inline)
                 .duoStreamingChrome(isStreaming, showSettings: $showSettings)
         }
@@ -125,9 +136,11 @@ struct ReceiverScreen: View {
                     Color.black.ignoresSafeArea()
                     VideoLayerView(displayLayer: model.receiver.displayLayer,
                                    receiver: model.receiver,
-                                   useMetal: metalRenderer)
+                                   useMetal: metalRenderer,
+                                   inputMode: model.receiver.macSupportsTrackpad ? (PhoneInputMode(rawValue: inputMode) ?? .touch) : .touch,
+                                   inputEnabled: scenePhase == .active && !showSettings && !showPairingApproval && !model.receiver.link.phase.isInTransition)
                         .id("\(metalRenderer)-\(metalDrawables)")   // rebuild the layer tree on toggle
-                        .ignoresSafeArea()
+                        .ignoresSafeArea(.container)
                     // Optional latency + FPS HUD, bottom-right corner. OFF by
                     // default: the live numbers now live in the Mac app's menu
                     // bar (the phone reports them over the control channel), so
@@ -171,6 +184,19 @@ struct ReceiverScreen: View {
                         }
                         .allowsHitTesting(false)   // never block touch input
                     }
+                    RemoteKeyboardControls(receiver:model.receiver)
+                    #if DEBUG
+                    Color.clear.allowsHitTesting(false).onAppear {
+                        if UserDefaults.standard.bool(forKey:"DuoUIPreviewKeyboardZoom") {
+                            DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { model.receiver.showPhoneKeyboard() }
+                        }
+                    }
+                    #endif
+                    #if DEBUG
+                    if UserDefaults.standard.bool(forKey:"DuoUIPreviewConnected") {
+                        Text("UI preview · no live Mac").font(.caption).foregroundStyle(.white.opacity(0.7)).allowsHitTesting(false)
+                    }
+                    #endif
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
@@ -181,15 +207,38 @@ struct ReceiverScreen: View {
             // The window, not this view: a sheet, the keyboard or the
             // hidden status bar change the view's frame but not the panel.
             .background(WindowObserver { model.updatePanel(window: $0) })
-            .sheet(isPresented: $showOnboarding) {
+            .sheet(isPresented: $showOnboarding,onDismiss:{
+                if pairingApproval.prompt != nil { showPairingApproval = true }
+            }) {
                 OnboardingView { onboardingDismissed = true }
             }
         }
-        .ignoresSafeArea(edges: isStreaming ? .all : [])
+        .ignoresSafeArea(.container, edges: isStreaming ? .all : [])
         .statusBarHidden(isStreaming)
         .systemOverlaysHidden(isStreaming)
-        .sheet(isPresented: $showSettings) {
-            SettingsView(receiver: model.receiver)
+        .fullScreenCover(isPresented: $showSettings, onDismiss: {
+            if pairingApproval.prompt != nil { openKeyboardAfterSettings = false;showPairingApproval = true;return }
+            guard openKeyboardAfterSettings else { return }
+            openKeyboardAfterSettings = false
+            guard model.receiver.connected, model.receiver.macSupportsKeyboard else { return }
+            // Wait for actual sheet dismissal, not a fixed delay. The editor
+            // can become first responder without competing with the sheet.
+            model.receiver.showPhoneKeyboard()
+        }) {
+            SettingsView(receiver: model.receiver, openKeyboard: {
+                openKeyboardAfterSettings = true
+                showSettings = false
+            })
+        }
+        .sheet(isPresented:$showPairingApproval,onDismiss:{
+            if pairingApproval.prompt != nil { pairingApproval.cancel() }
+        }) { PhonePairingSheet(pairing:pairingApproval) }
+        .onChange(of:pairingApproval.prompt?.id) { id in
+            guard id != nil else { showPairingApproval = false;return }
+            model.receiver.hidePhoneKeyboard();model.receiver.resetInputs()
+            if showSettings { showSettings = false }
+            else if showOnboarding { showOnboarding = false }
+            else { showPairingApproval = true }
         }
         // Below the force floor → blocking gate. Setter is a no-op: the user
         // cannot dismiss it, only update.
@@ -217,6 +266,10 @@ struct ReceiverScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
             showSettings = true
         }
+        .onChange(of: showSettings) { shown in
+            if shown && pairingApproval.prompt != nil { showSettings = false;return }
+            if shown { model.receiver.hidePhoneKeyboard(); model.receiver.resetInputs() }
+        }
         .onChange(of: scenePhase) { phase in
             Log.info("scenePhase -> \(String(describing: phase))")
             switch phase {
@@ -227,8 +280,9 @@ struct ReceiverScreen: View {
                 PairingDiscovery.shared.recover()
                 TrustedConnections.shared.browse(receiver: model.receiver)
                 TrustedConnections.shared.recoverAfterEnvironmentChange()
-            case .background: model.sceneDidBackground()
-            default: break
+            case .background: model.receiver.hidePhoneKeyboard(); model.receiver.resetInputs(); model.sceneDidBackground()
+            case .inactive: model.receiver.hidePhoneKeyboard(); model.receiver.resetInputs()
+            @unknown default: break
             }
         }
         // The deliberate "screen off" signal: locking the device makes
@@ -347,171 +401,159 @@ struct ConnectionNoticeView: View {
 struct IdleView: View {
     @ObservedObject var receiver: StreamReceiver
     @Binding var showSettings: Bool
-    @State private var connectionHelp = 0
     @ObservedObject private var pairingDiscovery = PairingDiscovery.shared
     @ObservedObject private var trusted = TrustedConnections.shared
     @AppStorage("deviceName") private var deviceName = ""
-    @ScaledMetric(relativeTo: .largeTitle) private var titleSize = 30.0
-
-    private var needsAttention: Bool { receiver.status.localizedCaseInsensitiveContains("fail") }
-    private var heading: String {
-        if receiver.connected { return "Getting your\ndisplay ready." }
-        if needsAttention { return "Let’s get you\nconnected." }
-        return "Your next\nscreen is ready."
+    @Environment(\.dynamicTypeSize) private var textSize
+    @State private var selectedOption:String?
+    private var previewScene:String? {
+        #if DEBUG
+        return UserDefaults.standard.string(forKey:"DuoUIPreviewHome")
+        #else
+        return nil
+        #endif
     }
 
     var body: some View {
         GeometryReader { geometry in
+            let columns = PhoneLayoutPolicy.columns(width:geometry.size.width,height:geometry.size.height,accessibility:textSize.isAccessibilitySize)
             ScrollView {
                 Group {
-                    if geometry.size.width > 650 {
-                        HStack(alignment: .center, spacing: 48) {
-                            welcome.frame(maxWidth: .infinity)
-                            pairing.frame(maxWidth: .infinity)
+                    if columns == 2 {
+                        HStack(alignment:.top,spacing:28) {
+                            welcome(compact:true).frame(width:240)
+                            pairing.frame(maxWidth:.infinity)
                         }
-                        .padding(.vertical, 28)
                     } else {
-                        VStack(spacing: 20) {
-                            welcome
-                            pairing
-                        }
-                        .padding(.top, 8)
+                        VStack(alignment:.leading,spacing:28) { welcome(compact:false);pairing }
                     }
-                }
-                .frame(maxWidth: 880)
-                .padding(.horizontal, 24).padding(.bottom, 28)
-                .frame(maxWidth: .infinity)
+                }.padding(24).frame(maxWidth:980).frame(maxWidth:.infinity,alignment:.leading)
             }
-        }
-        .background(Color(.systemBackground))
-        .tint(DuoPhoneTheme.accent)
+        }.background(Color(.systemGroupedBackground)).tint(DuoPhoneTheme.accent)
+    }
+    private func welcome(compact:Bool) -> some View {
+        PhoneWorkspaceHeader(name:PhoneName.current(appName:deviceName).name,
+            title:receiver.connected ? "Starting your display" : "Choose your Mac",
+            detail:receiver.connected ? "Keep SideExtend open while your Mac gets ready." : "Open SideExtend on your Mac. Use the same Wi-Fi or a USB cable.",compact:compact)
+    }
+    private var pairing:some View {
+        VStack(alignment:.leading,spacing:16) {
+            HStack {
+                Text("Available Macs").font(.headline).accessibilityAddTraits(.isHeader)
+                Spacer()
+                Button(action:refreshMacs) { Image(systemName:"arrow.clockwise").frame(width:44,height:44) }
+                    .accessibilityLabel("Refresh Macs").disabled(connectionBusy)
+            }
+            if connectionBusy {
+                HStack(spacing:10) {
+                    ProgressView()
+                    Text(pairingDiscovery.isPairing ? "Waiting for pairing approval" : "Connecting to your Mac…")
+                        .font(.subheadline).fixedSize(horizontal:false,vertical:true)
+                    Spacer()
+                    Button("Cancel") { if pairingDiscovery.isPairing { pairingDiscovery.cancelPairing() } else { trusted.cancel() } }
+                        .frame(minHeight:44)
+                }.accessibilityElement(children:.contain)
+            }
+            ForEach(Array(connectionOptions.enumerated()),id:\.element.id) { index,option in
+                if index > 0 { Divider() }
+                PhoneMacChoiceRow(name:option.name,detail:option.detail,
+                    actionTitle:connectionBusy && selectedOption == option.id ? "Connecting…" : option.action.isPairingAction ? "Connect" : option.title,
+                    enabled:option.enabled(busy:connectionBusy,connected:receiver.connected),
+                    busy:connectionBusy && selectedOption == option.id) { performPrimaryAction(option) }
+            }
+            if connectionOptions.isEmpty {
+                VStack(alignment:.leading,spacing:10) {
+                    Label("Looking for Macs",systemImage:"wifi").font(.headline)
+                    Text("Keep your Mac awake with SideExtend open.").font(.subheadline).foregroundStyle(.secondary)
+                }.frame(maxWidth:.infinity,alignment:.leading).padding(.vertical,12)
+            }
+            if let failure = connectionFailure {
+                Label(PhoneErrorCopy.summary(failure),systemImage:"exclamationmark.circle").font(.subheadline).foregroundStyle(.orange)
+                Button("Try again",action:refreshMacs).frame(minHeight:44)
+            } else if let actionMessage, !connectionBusy {
+                Text(actionMessage).font(.footnote).foregroundStyle(.secondary)
+            }
+            Divider()
+            DisclosureGroup("Connection help") {
+                VStack(alignment:.leading,spacing:12) {
+                    Text("Wi-Fi: keep both apps open on the same local network. Approve matching codes once on both devices for a new pair.")
+                    Text("USB: connect your iPhone with a data cable.")
+                    if let guidance = receiver.networkGuidance { Text(guidance.action) }
+                }.font(.subheadline).padding(.top,8)
+            }.frame(minHeight:44)
+            DisclosureGroup("Diagnostics") { PhoneDiagnosticsContent(receiver:receiver) }
+                .frame(minHeight:44)
+        }.padding(20).background(Color(.secondarySystemGroupedBackground),in:RoundedRectangle(cornerRadius:18))
+        .onChange(of:connectionBusy) { busy in if !busy { actionMessage = nil;selectedOption = nil } }
+        .onChange(of:connectionOptions) { _ in if !connectionBusy { actionMessage = nil } }
+        .onAppear { if previewScene == nil { trusted.browse(receiver:receiver);pairingDiscovery.browse() } }
     }
 
-    private var welcome: some View {
-        VStack(spacing: 12) {
-            Image("AppLogo").resizable().scaledToFit()
-                .frame(width: 68, height: 46).accessibilityHidden(true)
-                .padding(.bottom, 4)
-            Text(heading).font(.system(size: titleSize, weight: .bold)).tracking(-1.1)
-                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
-                .accessibilityAddTraits(.isHeader)
-            Text(receiver.connected ? "Keep this app open. Your Mac is starting the stream." : "Connect from your Mac.")
-                .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 7) {
-                if receiver.connected { ProgressView().controlSize(.small) }
-                else { Circle().fill(needsAttention ? Color.orange : DuoPhoneTheme.accent).frame(width: 7, height: 7) }
-                Text(receiver.connected ? "Preparing your display" : receiver.status)
-                    .font(.subheadline.weight(.medium))
-            }
-            .padding(.horizontal, 14).padding(.vertical, 9)
-            .background(Capsule().fill(Color(.secondarySystemBackground)))
-            .accessibilityElement(children: .combine)
-        }
-        .frame(maxWidth: .infinity)
+    @State private var actionMessage: String?
+    private var connectionBusy: Bool {
+        #if DEBUG
+        if previewScene == "connecting" { return true }
+        #endif
+        return pairingDiscovery.isPairing || trusted.connecting || trusted.awaitingPairedMac != nil
     }
-
-    private var pairing: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Trusted Macs").font(.headline)
-                Text("Your approved Macs stay here. Everyday Connect does not use the first-time pairing window.")
-                    .font(.footnote).foregroundStyle(.secondary)
-                ForEach(trusted.rememberedPeers) { peer in
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(peer.name).font(.headline)
-                        Text(trusted.availabilityLabel(for: peer.id)).font(.footnote).foregroundStyle(.secondary)
-                        HStack {
-                            Button("Connect") { trusted.connectPeer(peer.id) }
-                                .disabled(!trusted.canConnect(to: peer.id) || receiver.connected)
-                            Button("Forget Mac", role: .destructive) { trusted.revoke(peer.id) }
-                        }
-                    }
-                }
-                Button("Refresh Macs") { trusted.retryBrowse(receiver: receiver) }
-                Text("A sleeping Mac, a quit app, a locked session or blocked Local Network access may prevent connection. Duo Display cannot wake or unlock your Mac.")
-                    .font(.footnote).foregroundStyle(.secondary)
-                Text(trusted.status).font(.footnote)
-                if trusted.connecting { Button("Cancel") { trusted.cancel() } }
-            }.onAppear { trusted.browse(receiver: receiver); pairingDiscovery.browse() }
-            VStack(alignment: .leading, spacing: 10) {
-                Text("First-time pairing").font(.headline)
-                Text("Keep Duo Display open on your awake Mac and select it below. Confirm the matching code on both screens. Mac 1.0.3 (6) requires Pair a phone first; its window lasts 60 seconds. A USB cable alone does not open pairing.")
-                    .font(.footnote).foregroundStyle(.secondary)
-                ForEach(pairingDiscovery.macs, id: \.endpoint) { mac in
-                    if case .service(let name, _, _, _) = mac.endpoint {
-                        Button("Pair with \(name)") {
-                            pairingDiscovery.pair(with: mac, name: PhoneName.current().name)
-                        }
-                    }
-                }
-                Text(pairingDiscovery.status).font(.footnote)
-                Button("Find a new Mac for pairing") {
-                    pairingDiscovery.browse()
-                    trusted.retryBrowse(receiver: receiver)
-                }
-                DisclosureGroup("Discovery diagnostics") {
-                    Text(receiver.discoveryDiagnostic).font(.caption.monospaced())
-                    Text(pairingDiscovery.diagnostics).font(.caption.monospaced())
-                    Text("Discovery uses the local network. Enable Duo Display in Settings → Privacy & Security → Local Network if access was denied.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Button("Open Duo Display settings") {
-                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
-                    }
-                }
-            }
-            Picker("Connection instructions", selection: $connectionHelp) {
-                Text("USB").tag(0)
-                Text("Wi-Fi").tag(1)
-            }
-            .pickerStyle(.segmented)
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 12) {
-                    Image(systemName: connectionHelp == 0 ? "cable.connector" : "wifi")
-                        .font(.system(size: 22, weight: .medium)).foregroundStyle(DuoPhoneTheme.accent)
-                        .frame(width: 40, height: 40)
-                        .background(RoundedRectangle(cornerRadius: 12).fill(DuoPhoneTheme.accent.opacity(0.09)))
-                    Text(connectionHelp == 0 ? "Plug in. Spread out." : "More space. No cable.")
-                        .font(.headline).fixedSize(horizontal: false, vertical: true)
-                }
-                Text(connectionHelp == 0
-                     ? "Connect this \(deviceKind) to your Mac with USB. Open Duo Display on your Mac and choose this device."
-                     : "Put both devices on the same Wi-Fi network. Open Duo Display on your Mac, then choose the name below.")
-                    .font(.subheadline).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Divider()
-                HStack(spacing: 12) {
-                    Image(systemName: deviceKind == "iPad" ? "ipad" : "iphone").foregroundStyle(.secondary)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Look for this device").font(.caption).foregroundStyle(.secondary)
-                        Text(PhoneName.current(appName: deviceName).name).font(.subheadline.weight(.semibold)).lineLimit(2)
-                    }
-                    Spacer(minLength: 0)
-                }
-            }
-            .padding(20).frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 22).fill(Color(.secondarySystemBackground)))
-            if let guidance = receiver.networkGuidance {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(guidance.finding).font(.subheadline.weight(.medium))
-                    Text(guidance.action).font(.footnote).foregroundStyle(.secondary)
-                    Button("Open app settings") {
-                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
-                    }
-                    Button("Retry discovery") { receiver.retryDiscovery(); pairingDiscovery.browse(); trusted.retryBrowse(receiver: receiver) }
-                }.padding(16).background(RoundedRectangle(cornerRadius: 16).fill(Color(.secondarySystemBackground)))
-            }
-            Label("Keep Duo Display open while using your second screen.", systemImage: "display")
-                .font(.footnote).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 4)
+    private var connectionOptions: [MacConnectionOption] {
+        #if DEBUG
+        if let scene = previewScene {
+            if scene == "empty" { return [] }
+            return [.init(id:"fixture-mac",name:scene == "long-name" ? "Matthew’s studio MacBook Pro with a very long device name" : "Matthew’s MacBook Pro",detail:scene == "connecting" ? "Connecting…" : "Ready to connect",action:.connect("fixture-mac"))]
         }
-        .frame(maxWidth: 440)
+        #endif
+        return MacConnectionOption.make(remembered:trusted.rememberedPeers,
+            available:Set(trusted.rememberedPeers.filter { trusted.result(for:$0.id) != nil }.map(\.id)),
+            nearby:pairingDiscovery.macs.compactMap { result in
+                guard case .service(let name,_,_,_) = result.endpoint else { return nil }
+                return .init(token:String(describing:result.endpoint),name:name)
+            }, connected:receiver.connected)
+    }
+    private func performPrimaryAction(_ option: MacConnectionOption) {
+        guard previewScene == nil else { return } // Offline native UI fixture.
+        guard !connectionBusy, !receiver.connected else { return }
+        selectedOption = option.id
+        actionMessage = nil; trusted.clearFailure(); pairingDiscovery.clearFailure()
+        // Resolve again at tap time: a rendered row can outlive its discovery result.
+        guard let fresh = connectionOptions.first(where: { $0.id == option.id }), fresh.action == option.action else {
+            actionMessage = "Discovery changed. Select the refreshed Mac to continue."; refreshMacs(); return
+        }
+        switch fresh.action {
+        case .connect(let peer):
+            actionMessage = "Connecting…"
+            if !trusted.connectPeer(peer) { actionMessage = nil }
+        case .pair(let token):
+            guard let mac = pairingDiscovery.macs.first(where: { String(describing:$0.endpoint) == token }) else {
+                actionMessage = "Mac is no longer nearby. Refresh and try again."; return
+            }
+            actionMessage = "Pairing…"
+            if !pairingDiscovery.pair(with:mac,name:PhoneName.current().name,onPaired:{ peer in
+                trusted.connectAfterPairing(peer,receiver:receiver)
+            }) { actionMessage = nil }
+        case .search:
+            actionMessage = "Searching again. Keep both apps open on the same Wi-Fi."; refreshMacs()
+        case .none: break
+        }
+    }
+    private func refreshMacs() {
+        guard previewScene == nil else { return }
+        pairingDiscovery.clearFailure(); trusted.clearFailure()
+        pairingDiscovery.browse(); trusted.retryBrowse(receiver: receiver); receiver.retryDiscovery()
+    }
+    private var connectionFailure: String? {
+        #if DEBUG
+        if previewScene == "error" { return "Connection timed out" }
+        #endif
+        return trusted.lastFailure ?? pairingDiscovery.lastFailure ?? pairingDiscovery.discoveryFailure ?? trusted.discoveryFailure
     }
 }
 
 private enum DuoPhoneTheme {
     static let accent = Color(uiColor: .systemBlue)
+}
+private extension MacConnectionAction {
+    var isPairingAction:Bool { if case .pair = self { return true };return false }
 }
 
 private struct DuoConnectionOption: View {
@@ -575,71 +617,43 @@ struct HintRow: View {
 
 // MARK: - First-run onboarding (the Mac app is required to connect)
 
-/// Shown on first launch / while the device has never connected: Duo Display
+/// Shown on first launch / while the device has never connected: SideExtend
 /// is two apps, and the iOS side is useless without the Mac app running.
 struct OnboardingView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var textSize
     let onClose: () -> Void
-
-    var body: some View {
+    private func finish() { onClose();dismiss() }
+    private var introduction:some View {
+        VStack(alignment:.leading,spacing:14) {
+            Image(systemName:"laptopcomputer.and.iphone").font(.largeTitle).foregroundStyle(.tint).accessibilityHidden(true)
+            Text("A little more room.").font(.largeTitle.bold()).accessibilityAddTraits(.isHeader)
+            Text("Use your \(deviceKind) as a second display for your Mac.").foregroundStyle(.secondary)
+        }.fixedSize(horizontal:false,vertical:true).frame(maxWidth:.infinity,alignment:.leading)
+    }
+    private var steps:some View {
+        VStack(alignment:.leading,spacing:24) {
+            VStack(alignment:.leading,spacing:18) {
+                HintRow("Open SideExtend on your Mac.",systemImage:"1.circle")
+                HintRow("Join the same Wi-Fi, or use a USB data cable.",systemImage:"2.circle")
+                HintRow("Choose your Mac. For a new pair, approve matching codes on both devices.",systemImage:"3.circle")
+            }
+            Button(action:finish) { Text("Find my Mac").font(.headline).frame(maxWidth:.infinity,minHeight:44) }.buttonStyle(.borderedProminent)
+            Link(destination:macAppURL) { Label("Need the Mac app?",systemImage:"arrow.down.circle").frame(minHeight:44) }
+        }.frame(maxWidth:.infinity,alignment:.leading)
+    }
+    var body:some View {
         AdaptiveNavigation {
-            ScrollView {
-                VStack(spacing: 28) {
-                    Image(systemName: "laptopcomputer.and.iphone")
-                        .font(.system(size: 56, weight: .light))
-                        .foregroundStyle(.tint)
-                        .padding(.top, 24)
-
-                    VStack(spacing: 10) {
-                        Text("Two devices. One workspace.")
-                            .font(.title2.bold())
-                            .multilineTextAlignment(.center)
-                        Text("Duo Display turns this \(deviceKind) into a second screen for your Mac. It needs the **Duo Display Mac app** running on a Mac connected by the same USB cable or on the same WiFi network.")
-                            .font(.body)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    VStack(alignment: .leading, spacing: 14) {
-                        HintRow("Install the Duo Display Mac app on your Mac", systemImage: "1.circle.fill")
-                        HintRow("Connect the \(deviceKind) by USB, or join the same WiFi", systemImage: "2.circle.fill")
-                        HintRow("Keep this app open. Streaming starts automatically.", systemImage: "3.circle.fill")
-                    }
-                    .font(.subheadline)
-                    .padding(20)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(.secondarySystemBackground),
-                                in: RoundedRectangle(cornerRadius: 16))
-
-                    Link(destination: macAppURL) {
-                        Label("Get the Mac app", systemImage: "arrow.down.circle")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
-                    }
-                    .buttonStyle(.borderedProminent)
-
-                    Text("You can find this link again anytime in Settings — shake the \(deviceKind) to open it.")
-                        .font(.footnote)
-                        .foregroundStyle(.tertiary)
-                        .multilineTextAlignment(.center)
+            GeometryReader { geometry in
+                ScrollView {
+                    Group {
+                        if PhoneLayoutPolicy.columns(width:geometry.size.width,height:geometry.size.height,accessibility:textSize.isAccessibilitySize) == 2 {
+                            HStack(alignment:.top,spacing:32) { introduction;steps }
+                        } else { VStack(alignment:.leading,spacing:32) { introduction;steps } }
+                    }.padding(24).frame(maxWidth:860).frame(maxWidth:.infinity,alignment:.leading)
                 }
-                .padding()
-            }
-            .navigationTitle("Welcome")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button {
-                        onClose()
-                        dismiss()
-                    } label: {
-                        Label("Close", systemImage: "xmark")
-                    }
-                    .labelStyle(.iconOnly)
-                }
-            }
+            }.navigationTitle("Welcome to SideExtend").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement:.cancellationAction) { Button("Close",action:finish) } }
         }
     }
 }
@@ -649,10 +663,13 @@ struct OnboardingView: View {
 struct SettingsView: View {
     @ObservedObject private var trusted = TrustedConnections.shared
     @ObservedObject var receiver: StreamReceiver
+    var openKeyboard: () -> Void
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("showLatencyHUD") private var showLatencyHUD = false
     @AppStorage(TouchRipple.defaultsKey) private var touchRipple = true
+    @AppStorage(PhoneInputMode.defaultsKey) private var inputMode = PhoneInputMode.touch.rawValue
+    @AppStorage(PhoneHapticLevel.defaultsKey) private var hapticLevel = PhoneHapticLevel.standard.rawValue
 
     // Preserve existing preferences, but expose one mutually exclusive choice.
     private var statsMode: Binding<Int> {
@@ -671,126 +688,222 @@ struct SettingsView: View {
         return "Keep your second screen clear. Latency and FPS are still available in the Mac app’s menu bar."
     }
     private var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        let version = Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String ?? "dev"
+        let build = Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String ?? "local"
+        return "\(version) (\(build))"
     }
 
-    var body: some View {
+    @State private var confirmingDisconnect = false
+    @State private var disconnecting = false
+    @FocusState private var editingDeviceName:Bool
+    var body:some View {
         AdaptiveNavigation {
-            Form {
-                Section {
-                    HStack(spacing: 12) {
-                        Image(systemName: receiver.link.phase.settingsSymbol)
-                            .font(.title3)
-                            .foregroundStyle(receiver.link.phase.isStreaming ? Color.green
-                                             : receiver.link.phase.isInTransition ? Color.orange
-                                             : DuoPhoneTheme.accent)
-                            .frame(width: 28)
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(receiver.link.phase.settingsTitle)
-                                .font(.headline)
-                            if receiver.link.phase != .disconnected {
-                                Text(receiver.link.phase.fullLabel)
-                                    .font(.subheadline.weight(.medium))
-                            }
-                            Text(receiver.status).font(.footnote).foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel(receiver.link.phase.accessibilityLabel)
-                    .accessibilityValue(receiver.status)
-                    if receiver.pairedSession {
-                        Button("Disconnect from Mac") { receiver.disconnectPairedStream() }
-                    }
-                    DisclosureGroup("Trusted Macs") {
-                        ForEach(trusted.rememberedPeers) { peer in
-                            HStack {
-                                Text(peer.name)
-                                Spacer()
-                                Button("Revoke", role: .destructive) { trusted.revoke(peer.id) }
-                            }
-                        }
-                        Text("Revoking removes this device’s saved key and ends its paired Wi-Fi session. A new matching-code approval is required to pair again.").font(.footnote)
-                    }
-                    if receiver.connected && receiver.videoSize != .zero {
-                        LabeledRow("Resolution", value: "\(Int(receiver.videoSize.width)) × \(Int(receiver.videoSize.height))")
-                        LabeledRow("Frame rate", value: "\(receiver.fps) FPS")
-                    }
-                    HStack {
-                        Text("Device name")
-                        DeviceNameField { name in
-                            let announced = PhoneName.current(appName: name)
-                            receiver.setServiceName(announced.name, source: announced.source.rawValue)
-                        }.multilineTextAlignment(.trailing)
-                    }
-                } header: { Text("Connection") } footer: {
-                    Text(PhoneName.personalizedSystemName == nil
-                         ? "Your Mac shows this name in its device list. iOS doesn’t share this \(deviceKind)’s name from Settings with apps, so leave it blank to have your Mac use the name it reads over USB, or rename the device on your Mac."
-                         : "Your Mac shows this name in its device list. Leave it blank to use this \(deviceKind)’s name from Settings.")
-                }
-
-                Section {
-                    Picker("On-screen stats", selection: statsMode) {
-                        Text("Off").tag(0)
-                        Text("Compact").tag(1)
-                        Text("Detailed").tag(2)
-                    }.pickerStyle(.segmented)
-                    Text(statsDescription).font(.footnote).foregroundStyle(.secondary)
-                } header: { Text("On-screen stats") }
-
-                Section {
-                    ReceiverOrientationPicker()
-                } header: { Text("Remembered orientation") } footer: {
-                    Text("Saved on this \(deviceKind). The Mac uses the actual window orientation so video, cursor and touch stay aligned. iOS may restrict rotation in multitasking or Split View.")
-                }
-
-                Section {
-                    Toggle(isOn: $touchRipple) {
-                        Label("Touch feedback", systemImage: "hand.tap")
-                    }
-                    NavigationLink { DuoRenderingSettings() } label: {
-                        Label("Advanced video", systemImage: "slider.horizontal.3")
-                    }
-                } header: { Text("Display & touch") } footer: {
-                    Text("Touch feedback adds a small ripple where you tap. Turning it off leaves your gestures unchanged.")
-                }
-
-                Section {
-                    Link(destination: macAppURL) { Label("Get the Mac app", systemImage: "arrow.down.circle") }
-                    Button {
-                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
-                    } label: { Label("Wi-Fi permissions", systemImage: "wifi") }
-                    NavigationLink { DiagnosticsLogView() } label: {
-                        Label("Connection log", systemImage: "doc.text.magnifyingglass")
-                    }
-                } header: { Text("Help") } footer: {
-                    Text("Wi-Fi needs both devices on the same network and Local Network access. Logs stay on this device unless you share them.")
-                }
-
-                Section {
-                    LabeledRow("Duo Display", value: version)
-                    Link("myduodisplay.com", destination: URL(string: "https://myduodisplay.com")!)
-                    Link("Source & licenses", destination: URL(string: "https://github.com/matthewjgl/duo-display")!)
-                    if AppStore.isPubliclyAvailable { Link("Rate Duo Display", destination: AppStore.reviewURL) }
-                } header: { Text("About") }
-            }
-            .frame(maxWidth: 680).frame(maxWidth: .infinity)
-            .background(Color(.systemGroupedBackground))
-            .navigationTitle("Display settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .tint(DuoPhoneTheme.accent)
+            // One native scrolling surface in every size class. Two Forms
+            // side by side created independently sized/scrolling panels.
+            Form { sessionSection;inputSection;keyboardSection;displaySection;helpSection }
+            .navigationTitle(receiver.connected ? "Session controls" : "Settings")
+            .navigationBarTitleDisplayMode(.inline).tint(DuoPhoneTheme.accent)
+            .modifier(PhoneSettingsChrome())
+            .modifier(SessionSideRail(done:{dismiss()},disconnect:{confirmingDisconnect = true},canDisconnect:!editingDeviceName && (receiver.connected || receiver.link.phase.isInTransition),disconnecting:disconnecting))
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button { dismiss() } label: { Label("Done", systemImage: "checkmark") }
-                        .labelStyle(.iconOnly)
+                ToolbarItemGroup(placement:.keyboard) {
+                    Spacer()
+                    Button("Hide keyboard") { editingDeviceName = false }
                 }
             }
-            .onAppear {
-                if showAnalytics && showLatencyHUD { showLatencyHUD = false }
+            .confirmationDialog("Disconnect from your Mac?",isPresented:$confirmingDisconnect,titleVisibility:.visible) {
+                Button("Disconnect",role:.destructive) {
+                    disconnecting = true
+                    receiver.disconnectForUser { disconnecting = false;dismiss() }
+                }
+                Button("Keep connected",role:.cancel) {}
+            } message: { Text("Your paired Macs and preferences will stay saved.") }
+            .onAppear { if showAnalytics && showLatencyHUD { showLatencyHUD = false } }
+        }.statusBarHidden(false)
+    }
+    private var sessionSection:some View {
+        Section {
+            if receiver.connected,let scope = receiver.gestureProfileID,
+               let peer = trusted.rememberedPeers.first(where:{scope.split(separator:":").map(String.init).contains($0.id)}) {
+                Text(peer.name).font(.headline).fixedSize(horizontal:false,vertical:true)
             }
+            VStack(alignment:.leading,spacing:5) {
+                Label(receiver.connected ? receiver.link.phase.settingsTitle : "Not connected",systemImage:receiver.link.phase.settingsSymbol).font(.headline)
+                if receiver.connected { Text(receiver.link.phase.fullLabel).font(.subheadline).foregroundStyle(.secondary) }
+            }.accessibilityElement(children:.combine).accessibilityLabel(receiver.link.phase.accessibilityLabel)
+            HStack {
+                Text("This iPhone")
+                DeviceNameField(focus:$editingDeviceName) { name in
+                    let announced = PhoneName.current(appName:name)
+                    receiver.setServiceName(announced.name,source:announced.source.rawValue)
+                }.multilineTextAlignment(.trailing).accessibilityLabel("This iPhone’s device name")
+            }
+        } header: { Text("Session") }
+    }
+    private var inputSection:some View {
+        Section {
+            Picker("Input mode",selection:Binding(get:{receiver.macSupportsTrackpad ? inputMode : PhoneInputMode.touch.rawValue},set:{inputMode = $0})) {
+                Text("Touch").tag(PhoneInputMode.touch.rawValue)
+                Text("Trackpad").tag(PhoneInputMode.trackpad.rawValue).disabled(!receiver.macSupportsTrackpad)
+            }.pickerStyle(.segmented).disabled(!receiver.connected)
+                .onChange(of:inputMode) { _ in receiver.resetInputs() }
+            if inputMode == PhoneInputMode.trackpad.rawValue && receiver.macSupportsTrackpad {
+                TrackpadSpeedControl()
+                NavigationLink { TrackpadGestureSettings(receiver:receiver) } label: { Label("Trackpad gestures",systemImage:"hand.draw") }
+            }
+        } header: { Text("Input") } footer: {
+            Text(!receiver.connected ? "Connect to choose how you control your Mac." : inputMode == PhoneInputMode.trackpad.rawValue ? "Move the pointer from where it is. Tap to click; hold, then move to drag." : "Touch the desktop exactly where you want to interact.")
+        }
+    }
+    private var keyboardSection:some View {
+        Section {
+            Button(action:openKeyboard) { Label("Show keyboard",systemImage:"keyboard") }
+                .frame(minHeight:44)
+                .disabled(!receiver.connected || !receiver.macSupportsKeyboard || receiver.keyboardPresentation.focus?.allowsTyping != true)
+                .accessibilityHint("Close controls and type in the focused Mac field")
+            Picker("Haptics",selection:$hapticLevel) {
+                ForEach(PhoneHapticLevel.allCases,id:\.rawValue) { level in Text(level.rawValue.capitalized).tag(level.rawValue) }
+            }.accessibilityHint("Click and hold feedback in Touch and Trackpad")
+        } header: { Text("Keyboard & feedback") } footer: {
+            Text(receiver.keyboardPresentation.focus?.kind == .secure ? "Secure input is protected. Use your Mac keyboard." : "The keyboard opens when you select a supported text field. Use Show keyboard for manual access.")
+        }
+    }
+    private var displaySection:some View {
+        Section {
+            NavigationLink { PhoneArrangementView(receiver:receiver) } label: { Label("Arrange displays",systemImage:"rectangle.3.group") }
+                .disabled(!receiver.connected || !receiver.macSupportsArrangement)
+            ReceiverOrientationPicker()
+            Toggle(isOn:$touchRipple) { Label("Show touch points",systemImage:"hand.tap") }
+        } header: { Text("Display") }
+    }
+    private var helpSection:some View {
+        Section {
+            NavigationLink("Diagnostics") { PhoneDiagnosticsView(receiver:receiver) }
+            NavigationLink("Advanced display settings") {
+                Form {
+                    Section("On-screen stats") {
+                        Picker("Stats",selection:statsMode) { Text("Off").tag(0);Text("Compact").tag(1);Text("Detailed").tag(2) }
+                        Text(statsDescription).font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Section { NavigationLink("Video renderer") { DuoRenderingSettings() } }
+                }.navigationTitle("Advanced display")
+            }
+            Link(destination:macAppURL) { Label("Get the Mac app",systemImage:"arrow.down.circle") }
+            NavigationLink("About SideExtend") {
+                Form {
+                    LabeledRow("Version",value:version)
+                    Link("myduodisplay.com",destination:URL(string:"https://myduodisplay.com")!)
+                    Link("Source & licenses",destination:URL(string:"https://github.com/matthewjgl/duo-display")!)
+                    if AppStore.isPubliclyAvailable { Link("Rate SideExtend",destination:AppStore.reviewURL) }
+                }.navigationTitle("About SideExtend")
+            }
+        } header: { Text("Help & more") }
+    }
+}
+
+private struct SessionSideRail:ViewModifier {
+    var done:()->Void
+    var disconnect:()->Void
+    var canDisconnect:Bool
+    var disconnecting:Bool
+    func body(content:Content)->some View {
+        content.safeAreaInset(edge:.trailing,spacing:0) {
+            VStack(spacing:16) {
+                Button(action:done) {
+                    Image(systemName:"checkmark").font(.title3.weight(.semibold)).frame(width:48,height:48)
+                        .foregroundStyle(.white).background(Color.accentColor,in:Circle())
+                }.buttonStyle(.plain)
+                    .accessibilityLabel("Done").accessibilityHint("Return to your display")
+                if canDisconnect {
+                    Button(role:.destructive,action:disconnect) {
+                        Image(systemName:"xmark").font(.title3.weight(.semibold)).frame(width:48,height:48)
+                            .foregroundStyle(.red).background(Color.red.opacity(0.14),in:Circle())
+                    }.buttonStyle(.plain).disabled(disconnecting)
+                        .accessibilityLabel("Disconnect").accessibilityHint("Ask to end this display session")
+                }
+            }.padding(.horizontal,12).frame(maxHeight:.infinity)
+        }.sessionRailSafeArea()
+    }
+}
+
+// Extend only into Duo's reserved vertical rail. Ordinary iPhones keep
+// their notch/home-indicator safe areas, including in landscape.
+@available(iOS 27.1,*)
+private struct SessionRailSafeArea:ViewModifier {
+    @Environment(\.toolbarVerticalEdge) private var edge
+    func body(content:Content)->some View {
+        content.ignoresSafeArea(.container,edges:edge == .trailing ? .trailing : [])
+    }
+}
+private extension View {
+    @ViewBuilder func sessionRailSafeArea()->some View {
+        if #available(iOS 27.1,*) { modifier(SessionRailSafeArea()) }
+        else { self }
+    }
+}
+
+private struct PhoneSettingsChrome:ViewModifier {
+    @ViewBuilder func body(content:Content) -> some View {
+        if #available(iOS 16,*) {
+            content.toolbar(.visible,for:.navigationBar)
+                .toolbarBackground(.visible,for:.navigationBar)
+        } else { content.navigationBarHidden(false) }
+    }
+}
+
+private struct PhoneDiagnosticsView:View {
+    @ObservedObject var receiver:StreamReceiver
+    var body:some View {
+        Form {
+            Section("Connection") { PhoneDiagnosticsContent(receiver:receiver) }
+            if receiver.videoSize != .zero {
+                Section("Stream") {
+                    LabeledRow("Resolution",value:"\(Int(receiver.videoSize.width)) × \(Int(receiver.videoSize.height))")
+                    LabeledRow("Frame rate",value:"\(receiver.fps) FPS")
+                    Text(receiver.trackpadTimingSummary).font(.caption)
+                }
+            }
+            Section { TrustedMacManagement() }
+        }.navigationTitle("Diagnostics")
+    }
+}
+private struct PhoneDiagnosticsContent:View {
+    @ObservedObject var receiver:StreamReceiver
+    @ObservedObject private var trusted = TrustedConnections.shared
+    @ObservedObject private var pairing = PairingDiscovery.shared
+    var body:some View {
+        VStack(alignment:.leading,spacing:12) {
+            Text(receiver.status)
+            Text(trusted.status)
+            Text(pairing.status)
+            Text(receiver.discoveryDiagnostic)
+            Text(trusted.browserDiagnostic)
+            Text(pairing.diagnostics)
+            Text("No devices found does not by itself mean permission was denied.")
+            Button("Open Local Network settings") {
+                if let url = URL(string:UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+            }.frame(minHeight:44)
+            NavigationLink("Connection log") { DiagnosticsLogView() }
+        }.font(.caption).textSelection(.enabled).padding(.vertical,8)
+    }
+}
+private struct TrustedMacManagement:View {
+    @ObservedObject private var trusted = TrustedConnections.shared
+    @State private var pending:TrustedPeerRegistry.Record?
+    var body:some View {
+        DisclosureGroup("Paired Macs") {
+            ForEach(trusted.rememberedPeers) { peer in
+                HStack { Text(peer.name);Spacer();Button("Forget",role:.destructive) { pending = peer }.frame(minHeight:44) }
+            }
+            Text("Forgetting a Mac removes its pairing key. You will need to approve matching codes again.").font(.footnote)
+        }
+        .confirmationDialog("Forget this Mac?",isPresented:Binding(get:{pending != nil},set:{if !$0 { pending = nil }}),titleVisibility:.visible) {
+            Button("Forget Mac",role:.destructive) { if let peer = pending { trusted.revoke(peer.id) };pending = nil }
+            Button("Cancel",role:.cancel) { pending = nil }
         }
     }
 }
+
 
 private struct DuoRenderingSettings: View {
     @AppStorage("metalRenderer") private var metalRenderer = StreamReceiver.metalRendererDefault
@@ -810,7 +923,7 @@ private struct DuoRenderingSettings: View {
                         Text("iOS player").tag(1)
                     }.pickerStyle(.segmented)
                     if metalRenderer {
-                        Text("Metal draws decoded video frames directly. This is Duo Display’s default renderer.")
+                        Text("Metal draws decoded video frames directly. This is SideExtend’s default renderer.")
                             .font(.subheadline).foregroundStyle(.secondary)
                     } else {
                         Text("The iOS player lets the system present the video. Try it if Metal shows a blank picture or unstable playback.")
@@ -868,7 +981,7 @@ private struct DuoFloatingSettings: View {
                     Spacer()
                     Button { showSettings = true } label: {
                         Image(systemName: "slider.horizontal.3")
-                            .font(.body.weight(.medium)).foregroundStyle(.white)
+                            .font(.body.weight(.medium)).foregroundStyle(.primary)
                             .frame(width: 44, height: 44)
                             .background(.ultraThinMaterial, in: Circle())
                     }
@@ -949,7 +1062,7 @@ extension View {
 /// @ObservedObject so streaming updates can't rebuild it and steal focus.
 private struct DeviceNameField: View {
     @AppStorage("deviceName") private var deviceName = ""
-    @FocusState private var focused: Bool
+    let focus:FocusState<Bool>.Binding
     let onChange: (String) -> Void
 
     var body: some View {
@@ -957,7 +1070,7 @@ private struct DeviceNameField: View {
                   prompt: Text(PhoneName.personalizedSystemName ?? "Automatic"))
             .textInputAutocapitalization(.words)
             .autocorrectionDisabled()
-            .focused($focused)
+            .focused(focus)
             .onChange(of: deviceName) { name in onChange(name) }
     }
 }
@@ -1074,6 +1187,9 @@ final class ReceiverModel: ObservableObject {
     }
 
     func start() {
+        #if DEBUG
+        if UserDefaults.standard.bool(forKey:"DuoUIPreviewConnected") { receiver.debugGoOffline();receiver.debugConfigureUIControls();return }
+        #endif
         guard !started else { return }
         started = true
         #if DEBUG
@@ -1228,6 +1344,8 @@ struct VideoLayerView: UIViewRepresentable {
     let displayLayer: AVSampleBufferDisplayLayer
     let receiver: StreamReceiver
     let useMetal: Bool
+    let inputMode: PhoneInputMode
+    let inputEnabled: Bool
 
     func makeUIView(context: Context) -> VideoView {
         let view = VideoView()
@@ -1268,6 +1386,12 @@ struct VideoLayerView: UIViewRepresentable {
         pan.minimumNumberOfTouches = 2
         pan.maximumNumberOfTouches = 2
         view.addGestureRecognizer(pan)
+        view.directPan = pan
+        let secondary = UITapGestureRecognizer(target:view,action:#selector(VideoView.didSecondaryTap(_:)))
+        secondary.numberOfTouchesRequired = 2;secondary.require(toFail:pan)
+        view.addGestureRecognizer(secondary);view.directSecondary = secondary
+        view.installKeyboardViewportGestures()
+        view.configureInput(mode: inputMode, enabled: inputEnabled)
 
         // Local cursor echo: position updates ride the ~2ms control path
         // instead of the ~30ms video path, so the pointer feels native.
@@ -1290,13 +1414,122 @@ struct VideoLayerView: UIViewRepresentable {
 
     func updateUIView(_ uiView: VideoView, context: Context) {
         // videoSize arrives after the format description — re-fit the layers.
+        uiView.configureInput(mode: inputMode, enabled: inputEnabled)
+        uiView.refreshKeyboardViewport()
         uiView.setNeedsLayout()
     }
+    static func dismantleUIView(_ view: VideoView, coordinator: ()) { view.cancelActiveInput() }
 
-    final class VideoView: UIView {
+    final class VideoView: UIView, UIGestureRecognizerDelegate {
         weak var receiver: StreamReceiver?
         var metalRenderer: MetalVideoRenderer?
         let inputEngine = InputCaptureEngine()
+        var directPan: UIPanGestureRecognizer?
+        var directSecondary:UITapGestureRecognizer?
+        private var keyboardZoom = KeyboardZoomViewport()
+        private var zoomingForKeyboard = false
+        private var softwareKeyboardVisible = false
+        private var zoomFocusToken:String?
+        private var keyboardObserver:NSObjectProtocol?
+        private var keyboardTransitionUntil:Double = 0
+        private var zoomPinch:UIPinchGestureRecognizer?
+        private var zoomPan:UIPanGestureRecognizer?
+        private var localViewportTouches = false
+        func installKeyboardViewportGestures() {
+            let pinch = UIPinchGestureRecognizer(target:self,action:#selector(pinchViewport(_:)))
+            let pan = UIPanGestureRecognizer(target:self,action:#selector(panViewport(_:)))
+            pan.minimumNumberOfTouches = 2;pan.maximumNumberOfTouches = 2
+            for recognizer in [pinch,pan] { recognizer.delegate = self;recognizer.isEnabled = false;addGestureRecognizer(recognizer) }
+            zoomPinch = pinch;zoomPan = pan
+            keyboardObserver = NotificationCenter.default.addObserver(forName:UIResponder.keyboardWillChangeFrameNotification,object:nil,queue:.main) { [weak self] notification in
+                guard let self,let window = self.window,let end = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+                let frame = window.convert(end,from:window.screen.coordinateSpace)
+                self.keyboardTransitionUntil = ProcessInfo.processInfo.systemUptime+0.7
+                self.softwareKeyboardVisible = window.bounds.intersection(frame).height > 100
+                self.refreshKeyboardViewport()
+            }
+        }
+        deinit { if let keyboardObserver { NotificationCenter.default.removeObserver(keyboardObserver) } }
+        func refreshKeyboardViewport() {
+            let active = softwareKeyboardVisible && receiver?.keyboardPresentation.visible == true
+            let token = receiver?.keyboardPresentation.focus?.token
+            if active != zoomingForKeyboard || (active && token != zoomFocusToken) {
+                cancelActiveInput()
+                if active {
+                    keyboardZoom.focus(receiver?.keyboardPresentation.focus?.region,fallback:cursorNorm)
+                }
+                zoomingForKeyboard = active;zoomFocusToken = active ? token : nil
+                // Keyboard resizing is local, not a display topology change.
+                settledBounds = .zero;releaseHold()
+            }
+            zoomPinch?.isEnabled = active && acceptsInput
+            zoomPan?.isEnabled = active && acceptsInput
+            directPan?.isEnabled = !active && mode == .touch && acceptsInput
+            directSecondary?.isEnabled = !active && mode == .touch && acceptsInput
+            setNeedsLayout()
+        }
+        func gestureRecognizer(_ gestureRecognizer:UIGestureRecognizer,shouldRecognizeSimultaneouslyWith other:UIGestureRecognizer)->Bool {
+            (gestureRecognizer === zoomPan && other === zoomPinch) || (gestureRecognizer === zoomPinch && other === zoomPan)
+        }
+        @objc private func pinchViewport(_ recognizer:UIPinchGestureRecognizer) {
+            guard zoomingForKeyboard,let video = receiver?.videoSize else { return }
+            keyboardZoom.pinch(recognizer.scale,at:recognizer.location(in:self),video:video,in:bounds)
+            recognizer.scale = 1;setNeedsLayout()
+        }
+        @objc private func panViewport(_ recognizer:UIPanGestureRecognizer) {
+            guard zoomingForKeyboard,let video = receiver?.videoSize else { return }
+            keyboardZoom.pan(recognizer.translation(in:self),video:video,in:bounds)
+            recognizer.setTranslation(.zero,in:self);setNeedsLayout()
+        }
+        private var mode: PhoneInputMode = .touch
+        private var acceptsInput = true
+        private var trackpad = TrackpadGestureState()
+        private var trackpadTouches: [ObjectIdentifier: UITouch] = [:]
+        private var trackpadHold: DispatchWorkItem?
+        private var blockedUntilLift = false
+        private var inputBounds = CGRect.zero
+        // The streamed desktop is not a UIKit text editor. Opt this surface
+        // out of the public three-finger editing HUD in Trackpad mode; actual
+        // keyboard editors and system edge/home gestures keep their behavior.
+        override var editingInteractionConfiguration:UIEditingInteractionConfiguration {
+            mode == .trackpad ? .none : .default
+        }
+
+        func configureInput(mode: PhoneInputMode, enabled: Bool) {
+            guard self.mode != mode || acceptsInput != enabled else { return }
+            blockedUntilLift = trackpad.contactCount > 0 || downSent || pendingDown != nil
+            cancelActiveInput()
+            self.mode = mode; acceptsInput = enabled
+            directPan?.isEnabled = mode == .touch && enabled
+            directSecondary?.isEnabled = mode == .touch && enabled
+            refreshKeyboardViewport()
+        }
+        func cancelActiveInput() {
+            trackpadHold?.cancel(); trackpadHold = nil
+            for command in trackpad.cancel() { receiver?.sendTrackpad(command) }
+            trackpadTouches.removeAll(); discardPendingDown(); twoFingerActive = false
+            inputEngine.cancel()
+            receiver?.resetInputs()
+        }
+        private func trackpadTouchesChanged(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
+            trackpadHold?.cancel(); trackpadHold = nil
+            for touch in touches {
+                if phase == "ended" || phase == "cancelled" { trackpadTouches.removeValue(forKey: ObjectIdentifier(touch)) }
+                else { trackpadTouches[ObjectIdentifier(touch)] = touch }
+            }
+            if phase == "cancelled" { cancelActiveInput(); return }
+            let commands = trackpad.update(points: trackpadTouches.values.map { $0.location(in: self) },
+                                            time: ProcessInfo.processInfo.systemUptime)
+            for command in commands { receiver?.sendTrackpad(command) }
+            if trackpad.contactCount == 1 {
+                let hold = DispatchWorkItem { [weak self] in
+                    guard let self, self.acceptsInput, self.mode == .trackpad else { return }
+                    for command in self.trackpad.advance(time: ProcessInfo.processInfo.systemUptime) { self.receiver?.sendTrackpad(command) }
+                }
+                trackpadHold = hold
+                DispatchQueue.main.asyncAfter(deadline: .now() + TrackpadGestureState.holdDelay, execute: hold)
+            }
+        }
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
@@ -1311,6 +1544,22 @@ struct VideoLayerView: UIViewRepresentable {
         private var cursorNormSize = CGSize.zero
         private var cursorNorm = CGPoint(x: 0.5, y: 0.5)
         private var cursorVisible = false
+
+        #if DEBUG
+        private lazy var viewportPreview:CALayer = {
+            let preview = CALayer();preview.zPosition = 1
+            preview.actions = ["bounds":NSNull(),"position":NSNull()]
+            preview.contents = UIGraphicsImageRenderer(size:CGSize(width:900,height:1440)).image { context in
+                UIColor.systemIndigo.setFill();context.fill(CGRect(x:0,y:0,width:900,height:1440))
+                for y in stride(from:0,to:1440,by:120) {
+                    ("Desktop row \(y/120)" as NSString).draw(at:CGPoint(x:30,y:y),withAttributes:[.font:UIFont.systemFont(ofSize:30),.foregroundColor:UIColor.white])
+                }
+                UIColor.secondarySystemBackground.setFill();context.fill(CGRect(x:180,y:1080,width:585,height:86))
+                ("Message · sample field" as NSString).draw(at:CGPoint(x:200,y:1100),withAttributes:[.font:UIFont.systemFont(ofSize:28),.foregroundColor:UIColor.label])
+            }.cgImage
+            return preview
+        }()
+        #endif
 
         private var lastLoggedLayout = ""
 
@@ -1333,6 +1582,7 @@ struct VideoLayerView: UIViewRepresentable {
         /// Returns whether a hold just began, so the caller animates into it.
         private func updateHold() -> Bool {
             let video = receiver?.videoSize ?? .zero
+            if zoomingForKeyboard || ProcessInfo.processInfo.systemUptime < keyboardTransitionUntil { lastVideoSize = video;settledBounds = bounds;releaseHold();return false }
             if video != lastVideoSize || video == .zero || settledBounds == .zero
                 || bounds == settledBounds {
                 lastVideoSize = video
@@ -1382,6 +1632,21 @@ struct VideoLayerView: UIViewRepresentable {
 
         override func layoutSubviews() {
             super.layoutSubviews()
+            if let window {
+                // SwiftUI owns keyboard avoidance on the hosting view, not on
+                // UIWindow's keyboardLayoutGuide (which can stay empty).
+                // Re-measure the real remaining viewport after every rotation.
+                let visible = ReceiverViewport.hasSoftwareKeyboard(window:window.bounds,viewport:convert(bounds,to:window))
+                if visible != softwareKeyboardVisible {
+                    softwareKeyboardVisible = visible
+                    refreshKeyboardViewport()
+                }
+            }
+            if inputBounds != .zero && inputBounds.size != bounds.size {
+                blockedUntilLift = trackpad.contactCount > 0 || downSent || pendingDown != nil
+                cancelActiveInput()
+            }
+            inputBounds = bounds
             let holdBegan = updateHold()
             if blurView.superview == nil { addSubview(blurView) }
             blurView.frame = bounds
@@ -1399,6 +1664,12 @@ struct VideoLayerView: UIViewRepresentable {
             } else {
                 layer.sublayers?.first?.frame = videoRect() ?? bounds
             }
+            #if DEBUG
+            if UserDefaults.standard.bool(forKey:"DuoUIPreviewKeyboardZoom") {
+                if viewportPreview.superlayer == nil { layer.addSublayer(viewportPreview) }
+                viewportPreview.frame = videoRect() ?? bounds
+            }
+            #endif
             CATransaction.commit()
             CATransaction.begin()
             CATransaction.setDisableActions(true)
@@ -1410,6 +1681,14 @@ struct VideoLayerView: UIViewRepresentable {
             let line = "layout: bounds=\(Int(bounds.width))x\(Int(bounds.height))"
                 + " video=\(Int(video.width))x\(Int(video.height))"
                 + " layer=\(Int(layer.sublayers?.first?.frame.width ?? -1))x\(Int(layer.sublayers?.first?.frame.height ?? -1))"
+            #if DEBUG
+            if UserDefaults.standard.bool(forKey:"DuoUIPreviewKeyboardZoom") {
+                accessibilityIdentifier = "keyboard-viewport-preview"
+                accessibilityLabel = "Keyboard viewport preview"
+                accessibilityValue = "active=\(zoomingForKeyboard),software=\(softwareKeyboardVisible),presentation=\(receiver?.keyboardPresentation.visible == true),bounds=\(bounds),window=\(window?.bounds ?? .zero)"
+                isAccessibilityElement = true
+            }
+            #endif
             if line != lastLoggedLayout {
                 lastLoggedLayout = line
                 Log.info(line)
@@ -1421,6 +1700,8 @@ struct VideoLayerView: UIViewRepresentable {
         private func videoRect() -> CGRect? {
             guard let video = receiver?.videoSize, video != .zero,
                   bounds.width > 0, bounds.height > 0 else { return nil }
+            if zoomingForKeyboard { return keyboardZoom.rect(video:video,in:bounds) }
+            if !holdingStaleFrame { return ReceiverViewport.rect(video:video,in:bounds) }
             let fit = min(bounds.width / video.width, bounds.height / video.height)
             let cover = max(bounds.width / video.width, bounds.height / video.height)
             let scale = holdingStaleFrame ? cover : fit
@@ -1511,6 +1792,13 @@ struct VideoLayerView: UIViewRepresentable {
                 twoFingerActive = false
             }
         }
+        @objc func didSecondaryTap(_ recognizer:UITapGestureRecognizer) {
+            guard mode == .touch,acceptsInput,recognizer.state == .ended,
+                  let n = normalized(recognizer.location(in:self)) else { return }
+            cancelActiveInput()
+            receiver?.sendTouch(phase:"moved",x:n.x,y:n.y)
+            receiver?.sendTrackpad(.secondaryClick)
+        }
 
         // A press is only a click once we know a second finger is not coming.
         // Sending `began` on contact posted a mouse-down we then had to take
@@ -1529,6 +1817,14 @@ struct VideoLayerView: UIViewRepresentable {
         /// commit it: press-and-hold menus and drag handles need the button.
         private let holdDelay: TimeInterval = 0.12
         private var pendingDownPoint: CGPoint = .zero
+        private var directTyping = PointerTypingIntent()
+        private var directHoldFeedback:DispatchWorkItem?
+        private var directFeedback = DirectTouchFeedbackState()
+        private func confirmDirectHold() {
+            guard downSent,acceptsInput,receiver?.connected == true,
+                  let feedback = directFeedback.engage(accepted:true) else { return }
+            receiver?.hidePhoneKeyboard();receiver?.inputFeedback?(feedback)
+        }
 
         /// Emit the withheld `began`, at the point the finger first landed so a
         /// drag starts where the user touched rather than where slop was crossed.
@@ -1537,12 +1833,13 @@ struct VideoLayerView: UIViewRepresentable {
             downSent = true
             holdTimer?.cancel()
             holdTimer = nil
-            receiver?.sendTouch(phase: "began", x: p.x, y: p.y)
+            downSent = receiver?.sendTouch(phase: "began", x: p.x, y: p.y) == true
         }
 
         /// Drop the press without a trace. Nothing reached the Mac, so there is
         /// no button to release and no click to suppress.
         private func discardPendingDown() {
+            directHoldFeedback?.cancel();directHoldFeedback = nil;directFeedback.cancel();directTyping.cancel()
             pendingDown = nil
             downSent = false
             holdTimer?.cancel()
@@ -1571,16 +1868,23 @@ struct VideoLayerView: UIViewRepresentable {
                 pendingDown = norm
                 pendingDownPoint = location
                 downSent = false
+                directFeedback.cancel()
+                directTyping.begin(location,time:ProcessInfo.processInfo.systemUptime)
+                let feedback = DispatchWorkItem { [weak self] in self?.confirmDirectHold() }
+                directHoldFeedback = feedback
+                DispatchQueue.main.asyncAfter(deadline:.now()+0.4,execute:feedback)
                 let work = DispatchWorkItem { [weak self] in self?.commitPendingDown() }
                 holdTimer = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + holdDelay, execute: work)
                 return
             case "ended":
+                let tap = directTyping.end(touch.location(in:self),time:ProcessInfo.processInfo.systemUptime)
                 // A tap: nothing was posted yet, so post the whole click now.
                 if pendingDown != nil, !downSent { commitPendingDown() }
                 // No down means the press was already discarded (a second
                 // finger took it), so there is nothing to release.
-                if downSent { receiver?.sendTouch(phase: "ended", x: norm.x, y: norm.y) }
+                let accepted = downSent && receiver?.sendTouch(phase: "ended", x: norm.x, y: norm.y,typingIntent:tap) == true
+                if let feedback = directFeedback.complete(tap:tap,accepted:accepted) { receiver?.inputFeedback?(feedback) }
                 discardPendingDown()
                 return
             case "cancelled":
@@ -1590,6 +1894,11 @@ struct VideoLayerView: UIViewRepresentable {
                 discardPendingDown()
                 return
             case "moved":
+                directTyping.move(touch.location(in:self))
+                if hypot(touch.location(in:self).x-pendingDownPoint.x,touch.location(in:self).y-pendingDownPoint.y) > dragSlop {
+                    if pendingDown != nil,!downSent { commitPendingDown() }
+                    confirmDirectHold()
+                }
                 if pendingDown != nil, !downSent {
                     let moved = hypot(touch.location(in: self).x - pendingDownPoint.x,
                                       touch.location(in: self).y - pendingDownPoint.y)
@@ -1643,6 +1952,18 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         private func routeTouches(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?, ended: Bool) {
+            if !acceptsInput || blockedUntilLift {
+                if ended, event?.allTouches?.allSatisfy({ $0.phase == .ended || $0.phase == .cancelled }) != false { blockedUntilLift = false }
+                return
+            }
+            if zoomingForKeyboard {
+                let contacts = event?.allTouches?.filter { isFinger($0) && $0.phase != .ended && $0.phase != .cancelled }.count ?? 0
+                if contacts >= 2 || localViewportTouches {
+                    if !localViewportTouches { cancelActiveInput();localViewportTouches = true }
+                    if ended && contacts == 0 { localViewportTouches = false }
+                    return
+                }
+            }
             let pencil = touches.filter { isPencil($0) }
             let finger = touches.filter { isFinger($0) }
             let usePencilWire = receiver?.macSupportsPencilWire ?? false
@@ -1656,12 +1977,13 @@ struct VideoLayerView: UIViewRepresentable {
             }
             // Palm rejection: ignore resting fingers while the pen is down.
             if !finger.isEmpty && !inputEngine.hasActivePen {
-                send(phase, finger, event)
+                if mode == .trackpad, receiver?.macSupportsTrackpad == true { trackpadTouchesChanged(phase, finger, event) }
+                else if mode == .touch { send(phase, finger, event) }
             }
         }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-            if TouchRipple.isEnabled {
+            if mode == .touch && acceptsInput && TouchRipple.isEnabled {
                 for touch in touches where touch.type == .direct {
                     TouchRipple.show(in: layer, at: touch.location(in: self))
                 }
@@ -1780,6 +2102,10 @@ final class InputCaptureEngine: NSObject {
         }
     }
 
+    func cancel() {
+        activePens.removeAll()
+        if proximityActive { proximityActive = false; onProximity?(false, 0, 0) }
+    }
     func handle(_ touches: Set<UITouch>, event: UIEvent?, ended: Bool) {
         guard hostView != nil else { return }
         for touch in touches where touch.type == .pencil {

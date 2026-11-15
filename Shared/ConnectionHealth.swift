@@ -17,25 +17,25 @@ struct ConnectionGuidance: Equatable {
         case .mac: return .localNetworkDenied
         case .phone: return Self(
             finding: "iOS denied local-network discovery.",
-            action: "Enable Local Network for Duo Display in Settings, then reopen it. USB may still work. This does not indicate an account or sign-in problem.")
+            action: "Enable Local Network for SideExtend in Settings, then reopen it. USB may still work. This does not indicate an account or sign-in problem.")
         }
     }
 
     static let newerSettings = Self(
         finding: "This device has settings from a newer app version.",
-        action: "The saved record was left unchanged. Update Duo Display before editing this device’s setup.")
+        action: "The saved record was left unchanged. Update SideExtend before editing this device’s setup.")
     static let noDevices = Self(
         finding: "No receiver is currently discovered. This does not prove a permission problem.",
-        action: "Open Duo Display on the iPhone. For Wi-Fi, use the same trusted network and check Local Network access on both devices. Guest networks or VPNs may block discovery. USB: unlock the phone, use a data cable and accept Trust if prompted.")
+        action: "Open SideExtend on the iPhone. For Wi-Fi, use the same trusted network and check Local Network access on both devices. Guest networks or VPNs may block discovery. USB: unlock the phone, use a data cable and accept Trust if prompted.")
     static let localNetworkDenied = Self(
         finding: "macOS denied local-network discovery.",
-        action: "Enable Duo Display in System Settings → Privacy & Security → Local Network, then reopen the app. USB may still be available.")
+        action: "Enable SideExtend in System Settings → Privacy & Security → Local Network, then reopen the app. USB may still be available.")
     static let discoveryUnavailable = Self(
         finding: "Network discovery is temporarily unavailable; the cause is not confirmed.",
         action: "Check your network connection and try again. If it persists, check Local Network access. A VPN or guest-network isolation is a possible cause, not a confirmed one.")
     static let disconnected = Self(
         finding: "The connection ended before it could recover.",
-        action: "Keep Duo Display open and the phone unlocked. Reconnect USB, or check that the approved Wi-Fi receiver is still available, then choose Connect again. Your saved setup is kept.")
+        action: "Keep SideExtend open and the phone unlocked. Reconnect USB, or check that the approved Wi-Fi receiver is still available, then choose Connect again. Your saved setup is kept.")
     static let waitingForWiFi = Self(
         finding: "USB is unavailable. A unique approved Wi-Fi route is not currently available.",
         action: "Reconnect the data cable, or open the receiver on the same trusted Wi-Fi network. Connect over Wi-Fi once, or allow wireless handoff for this device. The display is held briefly, then safely removed if recovery fails.")
@@ -79,9 +79,12 @@ enum DiscoveryGuidance {
         return false
     }
     static let searching = "Looking for nearby Macs. Keep both apps open on the same local network. New pairing requires matching-code approval on both devices. Older Mac 1.0.3 (6) requires Pair a phone to open its 60-second window."
-    static let noPairableMac = "No Mac is currently advertising pairing. Check that the running Mac app is Duo Display 1.0.3 (6) or later, then choose Pair a phone and tap Find Macs again. Both apps need Local Network access on the same local network. A USB cable alone does not advertise a Mac. If already paired, use Your Macs instead. Guest Wi-Fi or a VPN may block discovery; an empty list alone does not prove permission was denied."
-    static let noTrustedMac = "No trusted Mac is currently reachable. Your remembered pairings are kept. The Mac must be awake, unlocked, running Duo Display with trusted-phone connections enabled. Check Local Network access and the same local network. Revocation or guest-network/VPN isolation are possible causes. First-time pairing is needed only for a new or revoked relationship."
+    static let noPairableMac = "No Mac pairing advertisement has reached this phone. This does not mean the Mac is not advertising. Check that the running Mac app is SideExtend 1.0.3 (6) or later, then choose Pair a phone and tap Find Macs again. Both apps need Local Network access on the same local network. A USB cable alone does not advertise a Mac. If already paired, use Your Macs instead. Guest Wi-Fi or a VPN may block discovery; an empty list alone does not prove permission was denied."
+    static let noTrustedMac = "No trusted Mac is currently reachable. Your remembered pairings are kept. The Mac must be awake, unlocked, running SideExtend with trusted-phone connections enabled. Check Local Network access and the same local network. Revocation or guest-network/VPN isolation are possible causes. First-time pairing is needed only for a new or revoked relationship."
     static func failure(_ error: NWError, on platform: ConnectionGuidance.DiscoveryPlatform) -> String {
+        if case .posix(let code) = error, code == .ETIMEDOUT {
+            return "Discovery did not become ready before its startup deadline. Automatic recovery is scheduled. Check Local Network access and that both devices share a reachable local network; VPN or guest-network isolation are possible causes, not a confirmed diagnosis. Retry discovery or reopen the app if this persists."
+        }
         let guidance = ConnectionGuidance.discoveryError(error, on: platform)
         return guidance.finding + " " + guidance.action + " Then retry discovery."
     }

@@ -34,6 +34,58 @@ final class TrustedReconnectTests: XCTestCase {
         let e = expectation(description: "receiver stopped"); receiver.stop { e.fulfill() }
         await fulfillment(of: [e], timeout: 5)
     }
+    func testStaleConnectReportsFailureAndRecoversOnFreshDiscovery() async throws {
+        let key = SymmetricKey(size:.bits256), mid = UUID().uuidString, pid = UUID().uuidString
+        let mac = client(mid,ReconnectVault([pid:key]),prefs()), phone = client(pid,ReconnectVault([mid:key]),prefs()), r = receiver()
+        defer { mac.shutdown(); phone.shutdown() }
+        var requests = 0
+        mac.serve(name:"Stale discovery Mac") { _,_,_ in requests += 1; return "Mac busy. Retry later." }
+        phone.browse(receiver:r)
+        let found = try await eventually { phone.result(for:mid) != nil }; XCTAssertTrue(found)
+        let stale = try XCTUnwrap(phone.result(for:mid))
+        mac.shutdown()
+        let gone = try await eventually { phone.result(for:mid) == nil }; XCTAssertTrue(gone)
+        XCTAssertFalse(phone.connect(stale)); XCTAssertNotNil(phone.lastFailure)
+        XCTAssertFalse(phone.connectPeer(mid)); XCTAssertTrue(phone.lastFailure?.contains("no longer available") == true)
+        phone.clearFailure(); XCTAssertNil(phone.lastFailure)
+        mac.serve(name:"Stale discovery Mac") { _,_,_ in requests += 1; return "Mac busy. Retry later." }
+        let returned = try await eventually { phone.canConnect(to:mid) }; XCTAssertTrue(returned)
+        XCTAssertTrue(phone.connectPeer(mid)); XCTAssertFalse(phone.connectPeer(mid))
+        let rejected = try await eventually { !phone.connecting && phone.lastFailure?.contains("Mac busy") == true }; XCTAssertTrue(rejected)
+        XCTAssertEqual(requests,1)
+        phone.cancel(); XCTAssertFalse(phone.connecting)
+        await stop(r)
+    }
+    func testPairingConnectIntentWaitsForSignedDiscoveryAndStartsExactlyOnce() async throws {
+        let key = SymmetricKey(size: .bits256), mid = UUID().uuidString, pid = UUID().uuidString
+        let phone = client(pid, ReconnectVault([mid:key]), prefs()), r = receiver()
+        let mac = client(mid, ReconnectVault([pid:key]), prefs())
+        defer { phone.shutdown(); mac.shutdown() }
+        phone.connectAfterPairing(mid, receiver: r)
+        XCTAssertEqual(phone.awaitingPairedMac, mid)
+        var requests = 0
+        mac.serve(name: "Approved Mac") { _,_,_ in requests += 1; return "Mac busy. Retry later." }
+        let requested = try await eventually { requests == 1 && !phone.connecting }
+        XCTAssertTrue(requested, phone.status)
+        XCTAssertNil(phone.awaitingPairedMac)
+        mac.recoverAfterEnvironmentChange()
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(requests, 1, "Discovery refresh cannot repeat a consumed Connect intent")
+        await stop(r)
+    }
+    func testPairingConnectCancellationAndTimeoutRetireIntent() async throws {
+        let key = SymmetricKey(size: .bits256), mid = UUID().uuidString, pid = UUID().uuidString
+        let phone = TrustedConnections(ownID: pid, lookup: { $0 == mid ? key : nil }, peers: { [mid] }, preferences: prefs(), requestTimeout: 0.1)
+        let r = receiver(); defer { phone.shutdown() }
+        phone.connectAfterPairing(mid, receiver: r); phone.cancel()
+        XCTAssertNil(phone.awaitingPairedMac)
+        phone.connectAfterPairing(mid, receiver: r)
+        let expired = try await eventually { phone.awaitingPairedMac == nil && phone.status.contains("not reachable") }
+        XCTAssertTrue(expired, phone.status)
+        phone.connectAfterPairing("unknown", receiver: r)
+        XCTAssertNil(phone.awaitingPairedMac, "A copyable ID cannot create trusted intent")
+        await stop(r)
+    }
     func testTrustedDiscoverySurvivesRestartNetworkSleepAndDisableOutsidePairingWindow() async throws {
         let key = SymmetricKey(size: .bits256), macID = UUID().uuidString, phoneID = UUID().uuidString
         let macVault = ReconnectVault([phoneID:key]), phoneVault = ReconnectVault([macID:key])

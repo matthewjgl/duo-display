@@ -90,15 +90,15 @@ final class LogSnapshotFileNameTests: XCTestCase {
 
     func testDeviceNamesSurviveEveryFilesystemTheyPassThrough() {
         let name = LogSnapshot.fileName(deviceName: "Phil's iPad Pro 🎉", date: date)
-        XCTAssertTrue(name.hasPrefix("Duo Display-Phil-s-iPad-Pro-"), name)
+        XCTAssertTrue(name.hasPrefix("SideExtend-Phil-s-iPad-Pro-"), name)
         XCTAssertTrue(name.hasSuffix(".txt"), name)
         XCTAssertFalse(name.contains("--"), name)
     }
 
     func testAnUnusableNameFallsBackToATimestampAlone() {
         let name = LogSnapshot.fileName(deviceName: "///", date: date)
-        XCTAssertTrue(name.hasPrefix("Duo Display-"), name)
-        XCTAssertFalse(name.contains("Duo Display--"), name)
+        XCTAssertTrue(name.hasPrefix("SideExtend-"), name)
+        XCTAssertFalse(name.contains("SideExtend--"), name)
         XCTAssertTrue(name.hasSuffix(".txt"), name)
     }
 }

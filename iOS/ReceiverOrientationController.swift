@@ -26,7 +26,7 @@ final class ReceiverOrientationController: ObservableObject {
     func apply() {
         guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
             .first(where: { $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive }) else {
-            guidance = "Open Duo Display full screen, then retry orientation."; return
+            guidance = "Open SideExtend full screen, then retry orientation."; return
         }
         guard #available(iOS 16.0, *) else {
             // Never force KVC device orientation. Older iOS follows physical

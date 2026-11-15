@@ -2,7 +2,7 @@
 //
 // AVSampleBufferDisplayLayer hides decode and presentation scheduling and is
 // suspected of buffering ~1 extra frame (moonlight-qt ships a Metal path for
-// the same reason). Duo Display makes this the DEFAULT path ("metalRenderer"
+// the same reason). SideExtend makes this the DEFAULT path ("metalRenderer"
 // setting, on unless switched off; AVSBDL stays as the fallback). Upstream
 // measured AVSBDL reaching glass faster on its devices, so verify on the
 // phone with the latency HUD. Here the receiver decodes explicitly with
@@ -130,7 +130,7 @@ final class MetalVideoRenderer {
         metalLayer.isOpaque = true
         // Drawable depth. Upstream measured 3 drawables best (photon p50
         // ~58ms) and 2 WORSE (~88ms, background presents slip transactions)
-        // on its test devices. Duo Display defaults to 2 (one fewer frame of
+        // on its test devices. SideExtend defaults to 2 (one fewer frame of
         // queue) but keeps it switchable ("metalDrawableCount", 2 or 3, in
         // Settings) so it can be A/B'd on the real phone with the latency
         // HUD. presentsWithTransaction broke presented handlers on a

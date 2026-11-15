@@ -7,7 +7,7 @@ import Foundation
 
 enum AppStore {
     static let iOSAppID = "6830472572"
-    /// Duo Display is currently distributed through TestFlight, not a public listing.
+    /// SideExtend is currently distributed through TestFlight, not a public listing.
     static let isPubliclyAvailable = false
     /// Public TestFlight invite for the beta group (see TESTFLIGHT.md). It
     /// opens TestFlight, which offers the newest build to install.

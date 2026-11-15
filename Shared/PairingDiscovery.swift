@@ -24,6 +24,9 @@ final class PairingDiscovery: ObservableObject {
     private var registrationBlocked = false
     var onApprovalNeeded: (() -> Void)?
 
+    @Published private(set) var lastFailure: String?
+    @Published private(set) var discoveryFailure: String?
+    @Published private(set) var isPairing = false
     private var exchange: PairingExchange?
     private var window: Task<Void, Never>?
     private var emptyHint: Task<Void, Never>?
@@ -36,11 +39,12 @@ final class PairingDiscovery: ObservableObject {
     }
 
     var diagnostics: String {
-        "App: \(DiscoveryGuidance.localVersion())\nBonjour: \(Self.service) / \(Self.domain)\nBrowser: \(browserState)\nAdvertiser: \(advertiserState)\nPairable Macs: \(macs.count)"
+        "App: \(DiscoveryGuidance.localVersion())\nBonjour: \(Self.service) / \(Self.domain)\nBrowser: \(browserState)\nAdvertiser: \(advertiserState)\nPairable Macs: \(macs.count)\n\(browser?.diagnostic ?? "No local pairing browser")\nRoles: phone browses; Mac advertises. These are this app’s states, not the other device’s."
     }
 
     /// A deliberate retry replaces even a failed browser. It never resets keys
     /// or interrupts an in-progress pairing exchange or display session.
+    func clearFailure() { lastFailure = nil }
     func browse() {
         guard exchange == nil else { return }
         browser?.cancel(); emptyHint?.cancel(); macs = []
@@ -61,7 +65,9 @@ final class PairingDiscovery: ObservableObject {
             Task { @MainActor in
                 guard let self, let browse, self.browser === browse else { return }
                 switch state {
+                case .setup: self.browserState = "Starting (10-second readiness timeout)"
                 case .ready:
+                    self.discoveryFailure = nil
                     self.browserState = "Ready"
                     self.emptyHint?.cancel()
                     self.emptyHint = Task { [weak self, weak browse] in
@@ -74,6 +80,7 @@ final class PairingDiscovery: ObservableObject {
                     self.emptyHint?.cancel()
                     self.browserState = "Unavailable (\(error))"
                     self.status = DiscoveryGuidance.failure(error, on: .phone)
+                    self.discoveryFailure = self.status
                 case .cancelled: self.browserState = "Stopped"
                 default: break
                 }
@@ -200,32 +207,50 @@ final class PairingDiscovery: ObservableObject {
         }
     }
 
-    func pair(with mac: NWBrowser.Result, name: String) {
-        guard exchange == nil, macs.contains(mac) else { return }
+    private var pairedAction: ((String) -> Void)?
+
+    @discardableResult
+    func pair(with mac: NWBrowser.Result, name: String, onPaired: ((String) -> Void)? = nil) -> Bool {
+        guard exchange == nil else { return false }
+        guard macs.contains(mac) else {
+            lastFailure = "This pairing advertisement expired. Refresh Macs and try again."; status = lastFailure!; return false
+        }
+        lastFailure = nil
+        pairedAction = onPaired
         emptyHint?.cancel()
         start(NWConnection(to: mac.endpoint, using: .tcp), name: name, initiator: true)
+        return true
     }
 
     private func start(_ connection: NWConnection, name: String, initiator: Bool) {
         let exchange = PairingExchange(connection: connection, coordinator: .shared,
             ownID: PairingApprovalCoordinator.localID, name: name, initiator: initiator)
-        self.exchange = exchange
+        self.exchange = exchange; isPairing = true
         exchange.onPrompt = { [weak self] in self?.onApprovalNeeded?() }
         status = "Connecting for pairing…"
-        exchange.onComplete = { [weak self] _, _ in
-            self?.status = "Paired securely. Look for the Mac under Your Macs."
-            self?.exchange?.cancel(); self?.exchange = nil
+        exchange.onComplete = { [weak self] peer, _ in
+            let action = self?.pairedAction; self?.pairedAction = nil
+            self?.status = "Paired securely."
+            self?.exchange?.cancel(); self?.exchange = nil; self?.isPairing = false
             if self?.persistent == true { self?.recover() }
+            action?(peer)
         }
         exchange.onFailure = { [weak self] _ in
-            self?.status = "Pairing interrupted or rejected. Choose Pair a phone on the Mac, then Find Macs to try again."
-            self?.exchange = nil
+            self?.status = "Pairing interrupted or declined. Try Pair & Connect again."
+            self?.lastFailure = self?.status
+            self?.exchange = nil; self?.pairedAction = nil; self?.isPairing = false
             if self?.persistent == true { self?.recover() }
         }
         exchange.start()
     }
 
+    func cancelPairing() {
+        pairedAction = nil; exchange?.cancel(); exchange = nil; isPairing = false
+        status = "Pairing cancelled."; lastFailure = nil
+    }
+
     func stop() {
+        isPairing = false; pairedAction = nil
         advertisedName = nil; persistent = false
         recovery?.cancel(); recovery = nil; recoveryAttempt = 0
         path?.cancel(); path = nil

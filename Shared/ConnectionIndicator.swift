@@ -278,7 +278,7 @@ struct ConnectionIndicator: Equatable {
             // Gave up: no replacement link streamed. Say so, never "Connected".
             show(TransitionNotice(kind: .failure, symbol: "exclamationmark.triangle",
                                   title: "Disconnected",
-                                  detail: "Reconnect the USB cable, or put both devices on the same Wi-Fi network. Then open Duo Display on your Mac."),
+                                  detail: "Reconnect the USB cable, or put both devices on the same Wi-Fi network. Then open SideExtend on your Mac."),
                  until: now.addingTimeInterval(Self.failureVisible))
         }
         if let noticeExpires, now >= noticeExpires { clearNotice() }

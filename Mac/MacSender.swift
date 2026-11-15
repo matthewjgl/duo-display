@@ -112,7 +112,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor var onIdentityMismatch: (() -> Void)?
     @MainActor var onUSBUnavailable: (() -> Void)?
     // Stable per-device serial for the virtual display, so macOS can tell
-    // multiple Duo Display monitors apart and persist their arrangement.
+    // multiple SideExtend monitors apart and persist their arrangement.
     private let displaySerial: UInt32
     // How far this device's identity has already moved off its base serial
     // and productID (identities macOS saved hostile state for are abandoned
@@ -157,7 +157,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // bottleneck fired. Never encode-then-discard: dropping here avoids wasting
     // VT work on frames that would only add latency.
     private var pendingSends = 0
-    // Duo Display: 1 over USB (a cable never needs a pipeline to keep busy,
+    // SideExtend: 1 over USB (a cable never needs a pipeline to keep busy,
     // and a queued frame is only added latency), 3 elsewhere. Read under
     // `pipelineLock`; written by `applyTransportTuning()`.
     private var maxPendingSends = 3
@@ -229,7 +229,23 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
-    private var inputInjector: InputInjector?
+    private let arrangementLease = KeyboardSessionGuard()
+    @MainActor private var arrangementApplying = false
+    private var arrangementTimer: DispatchSourceTimer?
+    private var arrangementSession = UUID()
+    private var arrangementPollInFlight = false
+    private var lastArrangementReport: PhoneArrangementReport?
+    @MainActor private var phoneArrangementController: PhoneArrangementController?
+    private let keyboardFocus = KeyboardFocusMonitor()
+    private let keyboardQueue = DispatchQueue(label:"DuoDisplay.keyboard-focus",qos:.userInitiated)
+    private let keyboardSession = KeyboardSessionGuard()
+    private var keyboardSampleInFlight = false
+    private var keyboardAdmission = KeyboardAdmission()
+    private var gestureAdmission = TrackpadGestureAdmission()
+    private var directTypingIntent = PointerTypingIntent()
+    private var keyboardTimer: DispatchSourceTimer?
+    private var lastKeyboardFocus: KeyboardFocusReport?
+    private var inputInjector: InputInjector? { didSet { oldValue?.releaseAll() } }
 
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
@@ -768,8 +784,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // fall back to the kind from the hello rather than the generic label.
         if let resolved = displayNameResolver?(info) { setDisplayName(resolved) }
         let displayName = endpointName.hasPrefix("iPhone / iPad")
-            ? "Duo Display — \(info.kind)"
-            : "Duo Display — \(endpointName)"
+            ? "SideExtend — \(info.kind)"
+            : "SideExtend — \(endpointName)"
         // Keep one stable identity across rotations. Reconfiguration below
         // applies a new mode to the existing virtual monitor, so macOS keeps
         // its windows and arrangement attached to this physical device.
@@ -887,7 +903,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if sawPoisonedIdentity {
                 throw NSError(domain: "MacSender", code: 5, userInfo: [
                     NSLocalizedDescriptionKey: "saved display state in macOS is blocking "
-                        + "Duo Display's displays — log out and back in (or restart the Mac), then reconnect"])
+                        + "SideExtend's displays — log out and back in (or restart the Mac), then reconnect"])
             }
             throw identityError
         }
@@ -1480,6 +1496,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stop() {
+        arrangementLease.invalidate(); arrangementSession = UUID()
+        keyboardSession.invalidate()
+        inputInjector?.releaseAll()
         stopped = true
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
@@ -1507,6 +1526,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // UDP callbacks run there); tearing it down from the main actor races
         // them.
         queue.async { [weak self] in
+            self?.stopArrangementReports()
+            self?.stopKeyboardReports()
+            self?.inputInjector?.releaseAll()
             self?.closeCursorChannel()
             self?.stopUpgradeProbing()
             self?.captureRecoveryWork?.cancel()
@@ -1559,6 +1581,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.currentPathDirectLink = false   // the new transport re-classifies
             self.dialGeneration += 1   // a dial still in flight must not adopt
             let retiring = self.connection
+            self.stopArrangementReports()
+            self.stopKeyboardReports()
+            self.inputInjector?.releaseAll()
             self.connection = nil
             if let outgoing, outgoing === retiring {
                 self.announceAndCancel(outgoing,
@@ -1618,6 +1643,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// other path (WiFi, routed Ethernet, the dev loopback) keeps the
     /// redial loop: a drop there is never intent.
     private func linkDied(_ detail: String) {
+        inputInjector?.releaseAll()
         if currentPathDirectLink, case .tcp = transport {
             reportGone("cable link lost (\(detail)) — unplugging means disconnect, ending session")
         } else {
@@ -1855,6 +1881,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Announce an already-running stream before enabling frame sends on
         // this socket. VideoToolbox callbacks run independently of `queue`, so
         // setting connectionReady first would allow the reconnect IDR to win.
+        stopArrangementReports()
+        stopKeyboardReports()
         helloSeenOnConnection = false
         connectionReady = false
         queue.asyncAfter(deadline: .now() + 5) { [weak self] in
@@ -2046,6 +2074,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // so anything already in flight is either sent on WiFi before this
         // method runs or discarded after the generation advances below.
         connectionReady = false
+        inputInjector?.releaseAll()
+        stopArrangementReports()
+        stopKeyboardReports()
         // Detach the old connection's handler BEFORE cancelling: its
         // .cancelled callback arrives after becomeReady below and would
         // reset connectionReady, silently blackholing every send on the
@@ -2267,15 +2298,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                             hint = "\(self.endpointName) is asleep — reconnects when it wakes…"
                         } else if self.everConnected {
                             self.dialRefused()
-                            hint = "Device found — open the Duo Display app on it…"
+                            hint = "Device found — open the SideExtend app on it…"
                         } else {
                             // Never answered: end like a receiver that quit, so
                             // auto-connect leaves the device alone until it is
                             // replugged or connected by hand.
-                            hint = "Install Duo Display on the Android device and allow it to use the USB accessory"
+                            hint = "Install SideExtend on the Android device and allow it to use the USB accessory"
                             if !self.goneReported, !self.stopped {
                                 self.goneReported = true
-                                Log.info("Duo Display did not open on the Android device — ending session")
+                                Log.info("SideExtend did not open on the Android device — ending session")
                                 Task { @MainActor in self.onPeerClosed?() }
                             }
                         }
@@ -2283,7 +2314,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                         self.dialRefused()
                         hint = self.awaitingWake
                             ? "\(self.endpointName) is asleep — reconnects when it wakes…"
-                            : "Device found — open the Duo Display app on it…"
+                            : "Device found — open the SideExtend app on it…"
                     default:
                         Log.info("usb dial failed: \(error)")
                         hint = "USB connection failed: \(error.localizedDescription)"
@@ -2296,6 +2327,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func scheduleReconnect() {
+        stopArrangementReports()
+        stopKeyboardReports()
+        inputInjector?.releaseAll()
         guard !stopped else { return }
         if everConnected {
             if let since = disconnectedSince {
@@ -2631,7 +2665,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func receiveControl(on conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
-            guard let self, error == nil, let data, data.count == 4 else {
+            guard let self, self.connection === conn, error == nil, let data, data.count == 4 else {
                 if let error {
                     Log.info("control receive ended: \(error)")
                     // A receive error on the live connection is fatal to it.
@@ -2650,7 +2684,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
             guard len > 0, len < 1 << 20 else { return }
             conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
-                guard let self, error == nil, let payload, payload.count == len else { return }
+                guard let self, self.connection === conn, error == nil, let payload, payload.count == len else { return }
                 self.handleControl(payload)
                 self.receiveControl(on: conn)
             }
@@ -2658,6 +2692,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func handleControl(_ payload: Data) {
+        guard !stopped else { return }
         lastReceived = Date()
         guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
               let type = obj["type"] as? String else {
@@ -2776,11 +2811,77 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     if stream != nil { scheduleReconfigure() } else { _ = noteSelectionChange() }
                 }
             }
+        case "phoneArrangement":
+            guard permitsArrangementInput, let request = try? JSONDecoder().decode(PhoneArrangementRequest.self,from:payload) else { return }
+            switch request.action {
+            case .subscribe: startArrangementReports()
+            case .unsubscribe: stopArrangementReports(invalidate:false)
+            case .place,.undo: performPhoneArrangement(request)
+            }
+        case "keyboardInput":
+            guard permitsKeyboardInput, let conn = connection, let session = keyboardSession.current(),
+                  let command = try? JSONDecoder().decode(KeyboardCommand.self,from:payload) else { return }
+            let keyboardIntent = obj["keyboardIntent"] as? Int
+            let expires = ProcessInfo.processInfo.systemUptime + 2
+            let injector = inputInjector
+            keyboardQueue.async { [weak self,weak conn] in
+                guard let self, let conn, self.keyboardSession.matches(session) else { return }
+                let focus = self.keyboardFocus.sample(settledOnly:false)
+                let destination = focus.flatMap { self.keyboardFocus.destination(for:$0) }
+                let accepted = self.keyboardSession.perform(session,expires:expires) {
+                    guard let focus, let destination, let injector,
+                          self.keyboardAdmission.accept(command,focus:focus,authenticated:true) else { return false }
+                    let posted = injector.handleKeyboard(command,to:destination)
+                    if posted, command.action == .enter, let keyboardIntent, keyboardIntent > 0 {
+                        self.keyboardFocus.notePhoneClick(intent:keyboardIntent)
+                    }
+                    return posted
+                }
+                self.queue.async {
+                    guard self.connection === conn, self.keyboardSession.matches(session) else { return }
+                    self.sendKeyboardObject(["type":"keyboardAck","sequence":command.sequence,"focus":command.focus,"accepted":accepted])
+                    if !accepted { self.lastKeyboardFocus = nil; self.pollKeyboardFocus() }
+                }
+            }
+        case "inputReset": inputInjector?.releaseAll();directTypingIntent.cancel()
+        case "trackpadGesture":
+            guard permitsRelativeInput,(lastHello?.protocolVersion ?? 1) >= WireProtocol.gestureWireVersion,
+                  let request = try? JSONDecoder().decode(TrackpadGestureRequest.self,from:payload) else { return }
+            let admitted = gestureAdmission.accept(request,authenticated:true,now:ProcessInfo.processInfo.systemUptime)
+            let posted = admitted && inputInjector?.handleGestureShortcut(request.shortcut) == true
+            sendKeyboardObject(["type":"trackpadGestureResult","id":request.id,"accepted":posted])
+        case "trackpad":
+            guard permitsRelativeInput, let action = obj["action"] as? String else { return }
+            let handlingStart = ProcessInfo.processInfo.systemUptime
+            // A stalled socket/video queue must not play old pointer movement
+            // after recovery. Click/down/up/reset ordering is never discarded.
+            if TrackpadPacketFreshness.skip(action:action,sentMacMs:obj["t"] as? Double,nowMacMs:Date().timeIntervalSince1970*1000) {
+                if let probe = obj["probe"] as? Int { sendKeyboardObject(["type":"trackpadTiming","probe":probe,"stale":true]) }
+                return
+            }
+            if ["move","scroll","dragBegan"].contains(action) { suppressKeyboardInteraction() }
+            inputInjector?.handleTrackpad(action: action, dx: obj["dx"] as? Double ?? 0,
+                                         dy: obj["dy"] as? Double ?? 0, count: obj["count"] as? Int ?? 1)
+            if action == "click" { noteKeyboardInteraction(obj["keyboardIntent"] as? Int) }
+            if let timestamp = obj["t"] as? Double {
+                let age = Date().timeIntervalSince1970*1000-timestamp
+                if age > -50 && age < 3000 { inputLatencies.append(max(0,age));if inputLatencies.count > 240 { inputLatencies.removeFirst(120) } }
+            }
+            if let probe = obj["probe"] as? Int { sendKeyboardObject(["type":"trackpadTiming","probe":probe,"handlingMs":(ProcessInfo.processInfo.systemUptime-handlingStart)*1000]) }
         case "touch":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
                let y = obj["y"] as? Double {
                 inputInjector?.handleTouch(phase: phase, x: x, y: y)
+                let bounds = CGDisplayBounds(captureDisplayID)
+                let point = CGPoint(x:bounds.minX+x*bounds.width,y:bounds.minY+y*bounds.height)
+                switch phase {
+                case "began":suppressKeyboardInteraction();directTypingIntent.begin(point,time:ProcessInfo.processInfo.systemUptime)
+                case "moved":suppressKeyboardInteraction();directTypingIntent.move(point)
+                case "cancelled":directTypingIntent.cancel()
+                case "ended":if directTypingIntent.end(point,time:ProcessInfo.processInfo.systemUptime) { noteKeyboardInteraction(obj["keyboardIntent"] as? Int) }
+                default:break
+                }
                 if let t = obj["t"] as? Double {
                     let delta = Date().timeIntervalSince1970 * 1000 - t
                     if delta > -50, delta < 1000 {
@@ -3401,8 +3502,165 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
+    private func sendKeyboardObject(_ object: [String:Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject:object), let json = String(data:data,encoding:.utf8) else { return }
+        sendJSONFrame(json)
+    }
+    private func noteKeyboardInteraction(_ intent:Int?) {
+        guard let intent, intent > 0, let session = keyboardSession.current() else { return }
+        let point = inputInjector?.lastPostedPoint
+        keyboardQueue.async { [weak self] in
+            guard let self, self.keyboardSession.matches(session) else { return }
+            self.keyboardFocus.notePhoneClick(intent:intent,point:point)
+        }
+    }
+    private func suppressKeyboardInteraction() {
+        guard let session = keyboardSession.current() else { return }
+        keyboardQueue.async { [weak self] in
+            guard let self,self.keyboardSession.matches(session) else { return }
+            self.keyboardFocus.cancelPhoneIntent()
+        }
+    }
+    private func stopKeyboardReports() {
+        gestureAdmission = TrackpadGestureAdmission();directTypingIntent.cancel()
+        keyboardTimer?.cancel(); keyboardTimer = nil; lastKeyboardFocus = nil
+        keyboardSession.invalidate(); keyboardSampleInFlight = false
+        keyboardQueue.async { [weak self] in
+            guard let self, self.keyboardSession.current() == nil else { return }
+            self.keyboardFocus.resetSession(); self.keyboardAdmission = KeyboardAdmission()
+        }
+    }
+    private func startKeyboardReports() {
+        guard keyboardTimer == nil, permitsKeyboardInput, let conn = connection else { return }
+        let session = keyboardSession.begin()
+        keyboardQueue.async { [weak self] in
+            guard let self, self.keyboardSession.matches(session) else { return }
+            self.keyboardFocus.resetSession(); self.keyboardAdmission = KeyboardAdmission()
+        }
+        let timer = DispatchSource.makeTimerSource(queue:queue)
+        keyboardTimer = timer
+        timer.schedule(deadline:.now()+0.15,repeating:0.4)
+        timer.setEventHandler { [weak self,weak conn] in
+            guard let self, let conn, self.connection === conn, !self.stopped else { return }
+            self.pollKeyboardFocus()
+        }
+        timer.resume()
+    }
+    private func pollKeyboardFocus() {
+        guard permitsKeyboardInput, helloSeenOnConnection, !keyboardSampleInFlight,
+              let conn = connection, let session = keyboardSession.current() else { return }
+        let focusDisplayBounds = virtualDisplay.map { CGDisplayBounds($0.displayID) }
+        keyboardSampleInFlight = true
+        keyboardQueue.async { [weak self,weak conn] in
+            guard let self, let conn, self.keyboardSession.matches(session) else { return }
+            self.keyboardFocus.streamBounds = focusDisplayBounds
+            let report = self.keyboardFocus.sample()
+            self.queue.async {
+                guard self.connection === conn, self.keyboardSession.matches(session) else { return }
+                self.keyboardSampleInFlight = false
+                guard let report, report != self.lastKeyboardFocus else { return }
+                self.lastKeyboardFocus = report
+                guard let data = try? JSONEncoder().encode(report), var object = try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return }
+                object["type"] = "keyboardFocus"; self.sendKeyboardObject(object)
+            }
+        }
+    }
+    private var permitsArrangementInput: Bool {
+        permitsRelativeInput && (lastHello?.protocolVersion ?? 1) >= WireProtocol.arrangementWireVersion
+    }
+    private func stopArrangementReports(invalidate:Bool = true) {
+        arrangementTimer?.cancel(); arrangementTimer = nil
+        if invalidate { arrangementLease.invalidate(); arrangementSession = UUID() }
+        arrangementPollInFlight = false; lastArrangementReport = nil
+    }
+    private func startArrangementReports() {
+        guard arrangementTimer == nil, permitsArrangementInput else { return }
+        if arrangementLease.current() == nil { arrangementSession = arrangementLease.begin() }
+        let timer = DispatchSource.makeTimerSource(queue:queue); arrangementTimer = timer
+        timer.schedule(deadline:.now(),repeating:1)
+        timer.setEventHandler { [weak self] in self?.pollPhoneArrangement() }
+        timer.resume()
+    }
+    @MainActor private func arrangementController() -> PhoneArrangementController {
+        if let phoneArrangementController { return phoneArrangementController }
+        let lease = arrangementLease
+        let controller = PhoneArrangementController(read:PublicDisplayArrangement.read,configure:{ before,desired in
+            guard let active = lease.current() else { throw PublicDisplayArrangement.Failure.topologyChanged }
+            try await PublicDisplayArrangement.apply(from:before,to:desired,authorized:{ lease.matches(active) })
+        })
+        phoneArrangementController = controller; return controller
+    }
+    @MainActor private func arrangementContext(_ session:UUID) -> PhoneArrangementController.Context {
+        let display = virtualDisplay
+        let target = display?.displayID
+        let reason = mode != .extend ? "Arrangement is unavailable while mirroring. Select Extend on the Mac." :
+            (display == nil || target != captureDisplayID ? "The extended display is changing. Wait for video and try again." : nil)
+        return .init(session:session.uuidString + "-" + (display.map{String(describing:ObjectIdentifier($0))} ?? "none"),target:target,unavailable:reason)
+    }
+    private func sendArrangement(_ report:PhoneArrangementReport,requestID:String? = nil) {
+        guard let data = try? JSONEncoder().encode(report), var object = try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return }
+        object["type"] = "phoneArrangementState"; if let requestID { object["requestID"] = requestID }
+        guard let payload = try? JSONSerialization.data(withJSONObject:object),let json = String(data:payload,encoding:.utf8) else { return }
+        sendJSONFrame(json)
+    }
+    private func pollPhoneArrangement() {
+        guard !arrangementPollInFlight, permitsArrangementInput, let conn = connection else { return }
+        arrangementPollInFlight = true
+        let session = arrangementSession
+        Task { @MainActor [weak self,weak conn] in
+            guard let self,let conn,!self.stopped,self.arrangementLease.matches(session) else { return }
+            let report = self.arrangementController().snapshot(self.arrangementContext(session))
+            self.queue.async {
+                guard self.connection === conn,self.arrangementLease.matches(session) else { return }
+                self.arrangementPollInFlight = false
+                if report != self.lastArrangementReport { self.lastArrangementReport = report; self.sendArrangement(report) }
+            }
+        }
+    }
+    private func performPhoneArrangement(_ request:PhoneArrangementRequest) {
+        guard let conn = connection else { return }
+        let session = arrangementSession
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        inputInjector?.releaseAll()
+        Task { @MainActor [weak self,weak conn] in
+            guard let self,let conn,!self.stopped,self.arrangementLease.matches(session) else { return }
+            let controller = self.arrangementController(), context = self.arrangementContext(session)
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                let report = controller.snapshot(context,message:"The request expired before applying. Refresh and preview the current layout again.")
+                self.queue.async { if self.connection === conn && self.arrangementLease.matches(session) { self.sendArrangement(report,requestID:request.requestID) } }
+                return
+            }
+            guard !self.arrangementApplying else {
+                let report = controller.snapshot(context,message:"An arrangement is already being applied.")
+                self.queue.async { if self.connection === conn { self.sendArrangement(report,requestID:request.requestID) } }
+                return
+            }
+            self.arrangementApplying = true
+            defer { self.arrangementApplying = false }
+            let display = self.virtualDisplay
+            display?.beginPhoneArrangement()
+            let report = await controller.handle(request,context:context,stillCurrent:{
+                !self.stopped && self.connection === conn && self.arrangementLease.matches(session) &&
+                self.virtualDisplay === display && self.arrangementContext(session) == context
+            })
+            let success = report.applied
+            display?.finishPhoneArrangement(persist:success)
+            self.queue.async {
+                guard self.connection === conn,self.arrangementLease.matches(session) else { return }
+                self.lastArrangementReport = report; self.sendArrangement(report,requestID:request.requestID)
+            }
+        }
+    }
+    private var permitsKeyboardInput: Bool {
+        permitsRelativeInput && (lastHello?.protocolVersion ?? 1) >= WireProtocol.keyboardWireVersion
+    }
+    private var permitsRelativeInput: Bool {
+        if case .tcp = transport { return requiredPairedPeer != nil }
+        return true // OS-trusted USB/usbmux/accessory transport
+    }
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer)}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"trackpad\":\(permitsRelativeInput),\"keyboard\":\(permitsKeyboardInput),\"displayArrangement\":\(permitsArrangementInput),\"shortcutGestures\":\(permitsRelativeInput && (lastHello?.protocolVersion ?? 1) >= WireProtocol.gestureWireVersion)}")
+        startKeyboardReports()
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the
@@ -3436,8 +3694,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             "target": isMac ? "mac" : "ios",
             "store": isMac ? "https://myduodisplay.com" : AppStore.updateURL.absoluteString,
             "message": isMac
-                ? "The Duo Display Receiver app on that Mac is too old for this Mac. Get the latest Duo Display Receiver to reconnect."
-                : "This \(kind) app is too old for this Mac. Update Duo Display from \(AppStore.updateSourceName) to reconnect.",
+                ? "The SideExtend Receiver app on that Mac is too old for this Mac. Get the latest SideExtend Receiver to reconnect."
+                : "This \(kind) app is too old for this Mac. Update SideExtend from \(AppStore.updateSourceName) to reconnect.",
         ]
         if let data = try? JSONSerialization.data(withJSONObject: dict),
            let json = String(data: data, encoding: .utf8) {

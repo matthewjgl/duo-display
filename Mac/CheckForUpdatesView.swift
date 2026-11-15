@@ -49,7 +49,7 @@ enum DuoMacPage: String, CaseIterable, Identifiable {
         switch self {
         case .devices: return "Connect a device. Make room for what’s next."
         case .picture: return "Fine-tune your connected displays."
-        case .app: return "Make Duo Display fit your workflow."
+        case .app: return "Make SideExtend fit your workflow."
         case .permissions: return "Allow capture and control, with clear access status."
         }
     }

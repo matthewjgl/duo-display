@@ -22,7 +22,7 @@ final class PairingApprovalCoordinator: ObservableObject {
     @Published private(set) var prompt: Prompt?
     @Published private(set) var status = ""
     private var key: SymmetricKey?
-    private var localApproved = false
+    @Published private(set) var localApproved = false
     private var remoteApproved = false
     private var deadline = Date.distantPast
     private var timeout: Task<Void, Never>?

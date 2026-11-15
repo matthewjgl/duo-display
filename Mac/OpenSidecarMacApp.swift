@@ -87,7 +87,7 @@ enum MainWindow {
                 contentRect: NSRect(origin: .zero, size: ContentView.size),
                 styleMask: [.titled, .closable, .miniaturizable],
                 backing: .buffered, defer: false)
-            w.title = "Duo Display"
+            w.title = "SideExtend"
             w.contentView = NSHostingView(
                 rootView: ContentView(controller: SenderController.shared,
                                       updater: updater))
@@ -330,7 +330,7 @@ final class SenderController: ObservableObject {
             if fresh, let ms = session.live?.latencyMs { worst = max(worst ?? 0, ms) }
         }
         StatusItemTooltip.set(lines.isEmpty ? nil
-            : "Duo Display\n" + lines.joined(separator: "\n")
+            : "SideExtend\n" + lines.joined(separator: "\n")
               + "\nLatency: Mac capture → phone display, measured on the phone")
         let compact = (showLatencyInMenuBar && worst != nil) ? String(format: "%.0f ms", worst!) : ""
         if compact != menuBarCompact { menuBarCompact = compact }
@@ -437,13 +437,13 @@ final class SenderController: ObservableObject {
         PairingDiscovery.shared.advertise(name: Host.current().localizedName ?? "Mac", persistent: true)
         TrustedConnections.shared.serve(name: Host.current().localizedName ?? "Mac", availability: { [weak self] in
             guard let self, !self.trustedSessionUnavailable else { return "Mac session unavailable. Wake and unlock the Mac before connecting." }
-            guard CGPreflightScreenCaptureAccess() else { return "On the Mac, enable Screen Recording for Duo Display, then reopen it." }
-            guard InputInjector.hasInputControlPermission else { return "On the Mac, enable input control for Duo Display, then reopen it." }
+            guard CGPreflightScreenCaptureAccess() else { return "On the Mac, enable Screen Recording for SideExtend, then reopen it." }
+            guard InputInjector.hasInputControlPermission else { return "On the Mac, enable input control for SideExtend, then reopen it." }
             return nil
         }) { [weak self] peer, receiverID, endpoint in
             guard let self else { return "Mac unavailable." }
-            guard CGPreflightScreenCaptureAccess() else { return "On the Mac, enable Duo Display in Privacy & Security → Screen Recording, then reopen it." }
-            guard InputInjector.hasInputControlPermission else { return "On the Mac, enable Duo Display input control in Privacy & Security, then reopen it." }
+            guard CGPreflightScreenCaptureAccess() else { return "On the Mac, enable SideExtend in Privacy & Security → Screen Recording, then reopen it." }
+            guard InputInjector.hasInputControlPermission else { return "On the Mac, enable SideExtend input control in Privacy & Security, then reopen it." }
             guard let result = self.discovered.first(where: { self.txtID(of: $0) == receiverID }) else { return "Phone discovery is still pending. Keep both apps open and retry." }
             var bindings = UserDefaults.standard.dictionary(forKey: "duo.receiverPairBindings.v1") as? [String: String] ?? [:]
             if let existing = bindings[receiverID], existing != peer { return "This receiver identity belongs to another pairing. Pair again explicitly." }
@@ -720,7 +720,7 @@ final class SenderController: ObservableObject {
             usbProbeAttempted.remove(udid)
         }
         receiverClosedOnCable.subtract(detached)
-        // Duo Display: physically unplugging and replugging is a fresh "go".
+        // SideExtend: physically unplugging and replugging is a fresh "go".
         // A past Disconnect click opts an iPhone out of auto-connect until the
         // user clicks Connect; unplugging clears that, so plug-in-and-stream
         // keeps working after an earlier manual disconnect.
@@ -758,7 +758,7 @@ final class SenderController: ObservableObject {
                 self.usbProbes.removeValue(forKey: device.udid)
                 self.lastConnectionGuidance = ConnectionGuidance(
                     finding: "USB identity could not be confirmed for automatic switching.",
-                    action: "Unlock the phone and open Duo Display. If you recognize it, choose Connect manually; this may restart its display. The existing session has not been moved.")
+                    action: "Unlock the phone and open SideExtend. If you recognize it, choose Connect manually; this may restart its display. The existing session has not been moved.")
             }
         }
     }
@@ -1520,6 +1520,7 @@ final class SenderController: ObservableObject {
 final class PermissionMonitor: ObservableObject {
     @Published var screenRecording = false
     @Published var inputControl = false
+    @Published var keyboardFocusAccess = false
     private var observations = Set<AnyCancellable>()
     private var lastDiagnostic: String?
 
@@ -1537,6 +1538,7 @@ final class PermissionMonitor: ObservableObject {
     func refresh() {
         screenRecording = CGPreflightScreenCaptureAccess()
         inputControl = InputInjector.hasInputControlPermission
+        keyboardFocusAccess = AXIsProcessTrusted()
         let diagnostic = "screenCapture=\(screenRecording) eventPosting=\(inputControl) axClient=\(AXIsProcessTrusted())"
         if diagnostic != lastDiagnostic {
             Log.info("Permission check: \(diagnostic) bundle=\(Bundle.main.bundleIdentifier ?? "unknown") path=\(Bundle.main.bundlePath)")
@@ -1555,6 +1557,13 @@ final class PermissionMonitor: ObservableObject {
         refresh()
     }
 
+    /// This optional focus permission is requested only by the explicit Grant button.
+    func requestKeyboardFocus() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+        refresh()
+    }
+
     static func openPrivacyPane(_ anchor: String) {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
             NSWorkspace.shared.open(url)
@@ -1567,7 +1576,7 @@ struct ContentView: View {
     @ObservedObject private var pairingDiscovery = PairingDiscovery.shared
     @ObservedObject private var trustedConnections = TrustedConnections.shared
     @StateObject private var permissions = PermissionMonitor()
-    // Retained for the future signed Duo Display update integration.
+    // Retained for the future signed SideExtend update integration.
     let updater: SPUStandardUpdaterController?
 
     static let size = CGSize(width: 820, height: 640)
@@ -1593,8 +1602,13 @@ struct ContentView: View {
                     }
                     Spacer()
                     if page == .devices {
-                        Button("Pair a phone") {
-                            PairingDiscovery.shared.advertise(name: Host.current().localizedName ?? "Mac", persistent: true)
+                        if pairingDiscovery.isAdvertising {
+                            Label("Ready to pair", systemImage: "checkmark.shield")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Button("Pair device") {
+                                PairingDiscovery.shared.advertise(name: Host.current().localizedName ?? "Mac", persistent: true)
+                            }.buttonStyle(.borderedProminent)
                         }
                         Button(action: arrangeDisplays) {
                             Label("Arrange Displays…", systemImage: "rectangle.3.group")
@@ -1603,20 +1617,6 @@ struct ContentView: View {
                     }
                 }
                 .padding(.horizontal, 28).padding(.top, 26).padding(.bottom, 20)
-                if page == .devices, !pairingDiscovery.status.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label(pairingDiscovery.status, systemImage: pairingDiscovery.isAdvertising ? "antenna.radiowaves.left.and.right" : "info.circle")
-                            .font(.callout).fixedSize(horizontal: false, vertical: true)
-                        DisclosureGroup("Pairing diagnostics") {
-                            Text(controller.discoveryDiagnostic).font(.caption.monospaced())
-                            Text(pairingDiscovery.diagnostics).font(.caption.monospaced())
-                            Text(trustedConnections.serverStatus).font(.caption)
-                        }
-                        if pairingDiscovery.isAdvertising {
-                            Button("Close pairing window") { pairingDiscovery.stop() }
-                        }
-                    }.padding(.horizontal, 28).padding(.bottom, 12)
-                }
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
                         switch page {
@@ -1634,8 +1634,6 @@ struct ContentView: View {
                     DuoMacStatusPill(title: controller.running ? "Connected" : "Ready to connect",
                                      color: controller.running ? .green : .secondary)
                     Spacer()
-                    Button("Logs") { Log.revealInFinder() }
-                        .help("Reveal the Duo Display log files in Finder")
                     if let updater { CheckForUpdatesView(updater: updater) }
                     else { Link("Updates", destination: URL(string: "https://myduodisplay.com/download")!) }
                     Button("Quit") { NSApp.terminate(nil) }
@@ -1655,7 +1653,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 28) {
             HStack(spacing: 8) {
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 32, height: 32)
-                Text("Duo Display").font(.system(size: 15, weight: .semibold))
+                Text("SideExtend").font(.system(size: 15, weight: .semibold))
             }
             .padding(.horizontal, 8).padding(.top, 10)
             VStack(alignment: .leading, spacing: 8) {
@@ -1734,13 +1732,12 @@ struct ContentView: View {
                 connectionGuidance(guidance)
             }
             if controller.deviceEntries.isEmpty {
-                connectionGuidance(.noDevices)
-                Button("Retry discovery") { controller.retryDiscovery() }
+
                 VStack(spacing: 12) {
                     Image(systemName: "iphone.radiowaves.left.and.right")
                         .font(.system(size: 28, weight: .light)).foregroundStyle(DuoMacTheme.accent)
                     Text("Bring your next screen online").font(.headline)
-                    Text("Open Duo Display on your iPhone, iPad or Mac.\nConnect a USB cable or join the same Wi-Fi network.")
+                    Text("Open SideExtend on your iPhone, iPad or Mac.\nConnect a USB cable or join the same Wi-Fi network.")
                         .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 }
                 .padding(28).frame(maxWidth: .infinity)
@@ -1769,6 +1766,21 @@ struct ContentView: View {
                     Button("Disconnect All") { controller.disconnectAll() }
                 }
             }
+            DisclosureGroup("Diagnostics") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(controller.discoveryDiagnostic).font(.caption.monospaced())
+                    Text(pairingDiscovery.status).font(.caption)
+                    Text(pairingDiscovery.diagnostics).font(.caption.monospaced())
+                    Text(trustedConnections.serverStatus).font(.caption)
+                    HStack {
+                        Button("Retry discovery") { controller.retryDiscovery() }
+                        Button("Show logs") { Log.revealInFinder() }
+                        if pairingDiscovery.isAdvertising {
+                            Button("Stop new pairing") { pairingDiscovery.stop() }
+                        }
+                    }
+                }.padding(.top, 10).textSelection(.enabled)
+            }.font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -1862,7 +1874,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 20) {
         DuoMacCard("Trusted phones", symbol: "lock.shield") {
             Toggle("Allow paired phones to connect over Wi-Fi", isOn: $trustedConnections.allowTrustedPhones)
-            Text("After one matching-code approval, trusted phones can connect while this Mac is awake, unlocked, running Duo Display and has capture/control permissions. No Pair a phone click is needed again. Turning this off closes phone-initiated Wi-Fi sessions; USB and Mac-initiated connections remain available.")
+            Text("After one matching-code approval, trusted phones can connect while this Mac is awake, unlocked, running SideExtend and has capture/control permissions. No Pair a phone click is needed again. Turning this off closes phone-initiated Wi-Fi sessions; USB and Mac-initiated connections remain available.")
                 .font(.caption).foregroundStyle(.secondary)
             Text(trustedConnections.serverStatus).font(.callout)
             ForEach(trustedConnections.rememberedPeers) { peer in
@@ -1877,7 +1889,7 @@ struct ContentView: View {
         DuoMacCard("Make it yours", symbol: "slider.horizontal.3") {
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle("Auto-connect when a cable is plugged in", isOn: $controller.autoConnectOnCable)
-                    Text("Open Duo Display on the iPhone (it must be in the foreground; the Mac cannot launch it). Streaming starts as soon as the app is up. Unplugging and replugging also clears an earlier Disconnect.")
+                    Text("Open SideExtend on the iPhone (it must be in the foreground; the Mac cannot launch it). Streaming starts as soon as the app is up. Unplugging and replugging also clears an earlier Disconnect.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1896,7 +1908,7 @@ struct ContentView: View {
                         }
                     }
                     if controller.presentation == .background {
-                        Text("No menu bar or Dock icon — streaming keeps running. Open the Duo Display app again (Spotlight/Finder) to show this window.")
+                        Text("No menu bar or Dock icon — streaming keeps running. Open the SideExtend app again (Spotlight/Finder) to show this window.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -1919,9 +1931,16 @@ struct ContentView: View {
                     permissionRow(
                         InputInjector.permissionSettingsName,
                         granted: permissions.inputControl,
-                        help: "Allows taps, drags and scrolling from your device. Enable Duo Display in Privacy & Security → \(InputInjector.permissionSettingsName).",
+                        help: "Allows taps, drags and scrolling from your device. Enable SideExtend in Privacy & Security → \(InputInjector.permissionSettingsName).",
                         anchor: "Privacy_Accessibility",
                         request: { permissions.requestInputControl() }
+                    )
+                    permissionRow(
+                        "Automatic phone keyboard",
+                        granted: permissions.keyboardFocusAccess,
+                        help: "Optional Accessibility access identifies editable controls without reading their contents. Your Mac keyboard and display stream work without it.",
+                        anchor: "Privacy_Accessibility",
+                        request: { permissions.requestKeyboardFocus() }
                     )
                     // macOS offers no API to query Local Network access, so
                     // infer from discovery results and let the user check.
@@ -1929,7 +1948,7 @@ struct ContentView: View {
                         "Local Network",
                         granted: !controller.discovered.isEmpty,
                         uncertain: controller.discovered.isEmpty,
-                        help: "Required for WiFi mode. If no device appears in the Devices list, allow Duo Display under Privacy & Security → Local Network on this Mac AND on the device — and keep the Duo Display app open there.",
+                        help: "Required for WiFi mode. If no device appears in the Devices list, allow SideExtend under Privacy & Security → Local Network on this Mac AND on the device — and keep the SideExtend app open there.",
                         anchor: "Privacy_LocalNetwork"
                     )
             Button("Recheck permissions") { permissions.refresh() }
@@ -2006,13 +2025,15 @@ struct SessionRow: View {
                 .frame(width: 9, height: 9)
             VStack(alignment: .leading, spacing: 2) {
                 DeviceTitle(entry: entry)
-                Text("\(session.transportLabel) · \(session.status)")
+                Text(session.failed ? "Connection failed" : session.transportLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                 // Live numbers measured on the phone, refreshed ~1 Hz while
                 // the menu is open. "—" until the phone reports (or if it is
                 // an older app that never does).
+                DisclosureGroup("Connection details") {
+                    Text(session.status).font(.caption).foregroundStyle(.secondary)
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     let fresh = session.liveIsFresh(at: context.date)
                     VStack(alignment: .leading, spacing: 0) {
@@ -2035,6 +2056,7 @@ struct SessionRow: View {
                     }
                     .lineLimit(1)
                     .help("Measured on the phone: latency is the time from the Mac capturing a frame to the phone showing it (needs the phone's clock sync with this Mac, so it can read a few ms off); fps is frames the phone actually received per second.")
+                }
                 }
             }
             Spacer()

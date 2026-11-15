@@ -1,4 +1,4 @@
-// Duo Display Receiver: the standalone "this Mac is a display" app (issues
+// SideExtend Receiver: the standalone "this Mac is a display" app (issues
 // #82/#17). It is a separate bundle from the sender on purpose: the sender
 // needs macOS 14 for its capture/virtual-display stack, while receiving only
 // needs the decoder and a window, so this target keeps a much lower
@@ -79,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let w = NSWindow(contentRect: NSRect(origin: .zero, size: ReceiverContentView.size),
                              styleMask: [.titled, .closable, .miniaturizable],
                              backing: .buffered, defer: false)
-            w.title = "Duo Display Receiver"
+            w.title = "SideExtend Receiver"
             w.contentView = hosting
             w.isReleasedWhenClosed = false
             w.setFrameAutosaveName("ReceiverPanel")
@@ -100,7 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About Duo Display Receiver",
+        appMenu.addItem(withTitle: "About SideExtend Receiver",
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
         appMenu.addItem(.separator())
@@ -113,10 +113,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             keyEquivalent: "").target = self
         }
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Hide Duo Display Receiver",
+        appMenu.addItem(withTitle: "Hide SideExtend Receiver",
                         action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit Duo Display Receiver",
+        appMenu.addItem(withTitle: "Quit SideExtend Receiver",
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         main.addItem(appItem)
@@ -159,7 +159,7 @@ struct ReceiverContentView: View {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable().frame(width: 52, height: 52)
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Duo Display Receiver").font(.system(size: 23, weight: .bold))
+                    Text("SideExtend Receiver").font(.system(size: 23, weight: .bold))
                     Text("Give this Mac a second life as a screen.")
                         .font(.callout).foregroundColor(.secondary)
                 }
@@ -182,7 +182,7 @@ struct ReceiverContentView: View {
                     .font(.caption).lineLimit(1)
                 Spacer()
                 Button("Logs") { Log.revealInFinder() }
-                    .help("Reveal the Duo Display Receiver log files in Finder")
+                    .help("Reveal the SideExtend Receiver log files in Finder")
                 if let updater { CheckForUpdatesView(updater: updater) }
                 else { Link("Updates", destination: URL(string: "https://myduodisplay.com/download")!) }
                 Button("Quit") { NSApp.terminate(nil) }

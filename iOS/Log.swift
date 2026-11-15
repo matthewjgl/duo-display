@@ -40,7 +40,7 @@ enum Log {
     }()
 
     static func info(_ message: String) {
-        NSLog("[Duo Display] %@", message)
+        NSLog("[SideExtend] %@", message)
         let line = "[\(formatter.string(from: Date()))] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
         queue.async { append(data) }
@@ -105,7 +105,7 @@ enum Log {
             try text.write(to: url, atomically: true, encoding: .utf8)
             return url
         } catch {
-            NSLog("[Duo Display] could not write the log snapshot: %@", error.localizedDescription)
+            NSLog("[SideExtend] could not write the log snapshot: %@", error.localizedDescription)
             return nil
         }
     }

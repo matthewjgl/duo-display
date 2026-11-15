@@ -420,7 +420,7 @@ final class StreamConfigurationTests: XCTestCase {
         XCTAssertNil(capability.maxHeight)
     }
 
-    // MARK: Codec override (Duo Display)
+    // MARK: Codec override (SideExtend)
 
     private let bothCodecs = [VideoCapability(codec: "h264"), VideoCapability(codec: "hevc")]
 

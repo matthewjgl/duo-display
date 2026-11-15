@@ -1,4 +1,4 @@
-# Duo Display Mac releases
+# SideExtend Mac releases
 
 The sender and receiver use separate signed Sparkle feeds hosted as GitHub Release
 assets in `matthewjgl/duo-display`. The release pipeline is independent of the
@@ -50,7 +50,7 @@ The frozen candidate is never overwritten by `prepare`.
 
 ## Draft, review, then publish
 
-After pushing the exact app sources to the Duo Display repository, write release
+After pushing the exact app sources to the SideExtend repository, write release
 notes that distinguish hardware-tested behavior from unverified behavior.
 
 ```sh
@@ -78,7 +78,7 @@ Keep sender and receiver feeds together on each stable release. A newer unrelate
 stable GitHub Release without these assets would break the `latest` feed URLs.
 Never mark a release latest until all assets are verified. The updater cannot
 update older OpenDisplay installations with different bundle IDs; those need an
-initial manual Duo Display installation.
+initial manual SideExtend installation.
 
 ## Current verification
 
@@ -115,3 +115,12 @@ preserved; the corrected distribution package uses a distinct request record.
 Notary credential lookup was verified using the default data-protection Keychain.
 An explicit login.keychain-db lookup does not find that profile; do not force a
 file-based Keychain when using the existing default-store profile.
+
+## SideExtend filename transition
+
+New application bundles and DMG volume labels use SideExtend / SideExtend Receiver.
+Primary downloads are SideExtend.dmg and SideExtendReceiver.dmg. Legacy download
+filenames remain byte-identical aliases so existing latest/download links work.
+Bundle IDs, signing requirements, Bonjour services, pairing records and Sparkle
+keys/feeds remain stable. New releases still require approval of the exact version
+and build. No automatic publication on Git pushes is configured.

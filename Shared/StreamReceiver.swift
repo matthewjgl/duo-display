@@ -1,5 +1,5 @@
 import dnssd
-// StreamReceiver — the listening half of Duo Display: receive video over
+// StreamReceiver — the listening half of SideExtend: receive video over
 // TCP and display it. Compiled into BOTH targets (see project.yml): it is
 // the iOS app's core, and the Mac app's receiver mode (issue #82) reuses it
 // unchanged to turn a spare Mac into a display.
@@ -116,6 +116,32 @@ final class StreamReceiver: ObservableObject {
     @Published private(set) var link = ConnectionStatus()
 
     /// True when the connected Mac understands pencil/proximity wire messages.
+    @Published private(set) var macSupportsTrackpad = false
+    @Published private(set) var macSupportsShortcutGestures = false
+    @Published private(set) var gestureProfileID:String?
+    @Published private(set) var gestureStatus:String?
+    @Published private(set) var trackpadTimingSummary = "No input timing samples yet"
+    var inputFeedback:((PhoneInputFeedback)->Void)?
+    private var feedbackState = PhoneInputFeedbackState()
+    private var gestureSequence = 0
+    private var pendingGestureID:String?
+    private var probeSequence = 0
+    private var probeStart:(id:Int,time:Double)?
+    private var timingSamples:[Double] = []
+    private var lastProbe = 0.0
+    @Published private(set) var macSupportsArrangement = false
+    @Published private(set) var phoneArrangement: PhoneArrangementReport?
+    @Published private(set) var arrangementPending = false
+    @Published private(set) var arrangementError: String?
+    private var arrangementRequestID: String?
+    private var arrangementWatchID: String?
+    @Published private(set) var macSupportsKeyboard = false
+    @Published private(set) var keyboardPresentation = KeyboardPresentationState()
+    @Published private(set) var keyboardError: String?
+    private var keyboardSequence = 0
+    private var keyboardInteraction = 0
+    private var keyboardDelivery = KeyboardDeliveryLedger()
+    var keyboardPendingCount: Int { keyboardDelivery.count }
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
 
     // Transport-switch overlay state. The tracker is main-thread only; the
@@ -213,6 +239,23 @@ final class StreamReceiver: ObservableObject {
                 self.closeSession(announcing: WireMessage.closing, status: "Disconnected", completion: nil)
             }
             DispatchQueue.main.async { self.pairedSession = false }
+        }
+    }
+    /// Explicit UI disconnect applies to both paired Wi-Fi and cable sessions.
+    /// Retain pairing/settings and re-arm discovery after retiring this socket.
+    func disconnectForUser(completion:(()->Void)? = nil) {
+        resetPhoneKeyboardSession();resignPhoneKeyboard?();resetInputs()
+        queue.async {
+            self.pendingPairedConnections.forEach { $0.cancel() };self.pendingPairedConnections.removeAll()
+            self.pairedListener?.cancel();self.pairedListener = nil
+            self.closeSession(announcing:WireMessage.closing,status:"Disconnected",completion:{
+                self.pairedConnection = nil
+                DispatchQueue.main.async {
+                    self.pairedSession = false
+                    self.ensureListening()
+                    completion?()
+                }
+            })
         }
     }
 
@@ -339,7 +382,7 @@ final class StreamReceiver: ObservableObject {
     private var photonWindow: [Double] = []
     private var loggedDisplayPath = false
     private var decodeErrorCount = 0
-    // Duo Display: Metal is the DEFAULT display path (key absent = on); the
+    // SideExtend: Metal is the DEFAULT display path (key absent = on); the
     // user can switch back to AVSampleBufferDisplayLayer in Settings. Upstream
     // measured the system video layer reaching glass faster on its devices
     // (dedicated compositor plane), so this must be A/B'd with the latency HUD.
@@ -385,7 +428,7 @@ final class StreamReceiver: ObservableObject {
     // needs an entitlement Apple gates behind approval and personal teams
     // can't get), so this is user-editable in Settings. The USB picker gets
     // the real name host-side via lockdownd regardless.
-    var serviceName = "Duo Display" {
+    var serviceName = "SideExtend" {
         didSet {
             let fitted = DeviceNameText.truncated(serviceName, maxBytes: DeviceNameText.maxServiceNameBytes)
             if fitted != serviceName { serviceName = fitted }
@@ -551,6 +594,16 @@ final class StreamReceiver: ObservableObject {
     /// Set by the simulator UI harness: no listener, no Bonjour, so a real
     /// Mac can never connect to a harness run.
     private(set) var debugOffline = false
+    @MainActor func debugConfigureUIControls() {
+        debugOffline = true
+        connected = true;videoSize = CGSize(width:1440,height:900)
+        macProtocolVersion = WireProtocol.version;macSupportsTrackpad = true;macSupportsKeyboard = true;macSupportsArrangement = true;macSupportsShortcutGestures = true
+        gestureProfileID = "fixture-mac:fixture-phone";pairedSession = true
+        let now = Date();indicator.linkAdopted(nil,now:now);indicator.linkReady(.wifi,now:now);indicator.firstFrame(now:now);publishSwitch(now:now)
+        keyboardPresentation.receive(.init(token:"preview-field",kind:.editable,interaction:1,phoneIntent:false,
+            region:UserDefaults.standard.bool(forKey:"DuoUIPreviewKeyboardZoom") ? CGRect(x:0.2,y:0.75,width:0.65,height:0.06) : nil))
+        if UserDefaults.standard.bool(forKey:"DuoUIPreviewKeyboardZoom") { videoSize = CGSize(width:900,height:1440) }
+    }
     func debugGoOffline() { debugOffline = true }
     #endif
 
@@ -1004,6 +1057,7 @@ final class StreamReceiver: ObservableObject {
         let adoptedTransport: StreamTransport? = transport == "USB" ? .usb : nil
         connection?.cancel()
         connection = conn
+        DispatchQueue.main.async { self.resetPhoneKeyboardSession(); self.resetPhoneArrangementSession() }
         // The race is decided: rival candidates die here.
         for pending in pendingConnections where pending !== conn { pending.cancel() }
         pendingConnections.removeAll()
@@ -1160,16 +1214,68 @@ final class StreamReceiver: ObservableObject {
                 self.cursorSprite = (image, anchor, normSize)
                 self.onCursorImage?(image, anchor, normSize)
             }
+        case "phoneArrangementState":
+            guard let data = try? JSONSerialization.data(withJSONObject:obj), let report = try? JSONDecoder().decode(PhoneArrangementReport.self,from:data) else { return }
+            let response = obj["requestID"] as? String
+            DispatchQueue.main.async {
+                guard self.macSupportsArrangement else { return }
+                self.phoneArrangement = report; self.arrangementError = nil
+                if response != nil && response == self.arrangementRequestID {
+                    self.arrangementPending = false; self.arrangementRequestID = nil
+                }
+            }
+        case "trackpadGestureResult":
+            DispatchQueue.main.async {
+                guard let id = obj["id"] as? String,id == self.pendingGestureID else { return }
+                self.pendingGestureID = nil
+                self.gestureStatus = obj["accepted"] as? Bool == true ? "Shortcut sent. macOS controls whether it takes effect." : "Shortcut blocked. Check input permission, secure input and your mapping."
+            }
+        case "trackpadTiming":
+            DispatchQueue.main.async {
+                guard let probe = obj["probe"] as? Int,let pending = self.probeStart,pending.id == probe else { return }
+                self.probeStart = nil
+                if obj["stale"] as? Bool == true {
+                    self.trackpadTimingSummary = "Stale pointer movement was skipped rather than replayed. Check connection and input round-trip timing.";return
+                }
+                let ms = (ProcessInfo.processInfo.systemUptime-pending.time)*1000
+                guard ms >= 0,ms < 3000 else { return }
+                self.timingSamples.append(ms);if self.timingSamples.count > 60 { self.timingSamples.removeFirst() }
+                let samples = self.timingSamples.sorted()
+                let handling = obj["handlingMs"] as? Double ?? 0
+                self.trackpadTimingSummary = "Input round trip: median \(Int(samples[samples.count/2])) ms · p95 \(Int(samples[min(samples.count-1,Int(Double(samples.count)*0.95))])) ms (\(samples.count) samples). Last Mac handler \(String(format:"%.1f",handling)) ms. Includes transport, queueing and reply; not video or OS presentation latency."
+            }
+        case "keyboardFocus":
+            guard let data = try? JSONSerialization.data(withJSONObject:obj), let report = try? JSONDecoder().decode(KeyboardFocusReport.self,from:data) else { return }
+            DispatchQueue.main.async {
+                guard self.macSupportsKeyboard else { return }
+                self.keyboardPresentation.receive(report)
+            }
+        case "keyboardAck":
+            guard let sequence = obj["sequence"] as? Int, let focus = obj["focus"] as? String else { return }
+            let accepted = obj["accepted"] as? Bool == true
+            DispatchQueue.main.async {
+                guard self.keyboardDelivery.complete(sequence,focus:focus) else { return }
+                if !accepted {
+                    self.keyboardError = "Keyboard input paused because focus or access changed. Check the Mac field before reopening Keyboard."
+                    self.keyboardPresentation.dismiss()
+                }
+            }
         case WireMessage.welcome:
             // The Mac identified itself (issue #132). If it speaks a protocol
             // older than we support, it's the Mac that needs updating — and an
             // old Mac can't diagnose that itself, so we surface it here.
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
+            let gestureProfile = connection === pairedConnection ? pairedIdentity : nil
             DispatchQueue.main.async {
+                self.gestureProfileID = gestureProfile
                 self.macProtocolVersion = macPV
+                self.macSupportsTrackpad = macPV >= WireProtocol.trackpadWireVersion && obj["trackpad"] as? Bool == true
+                self.macSupportsShortcutGestures = macPV >= WireProtocol.gestureWireVersion && obj["shortcutGestures"] as? Bool == true
+                self.macSupportsKeyboard = macPV >= WireProtocol.keyboardWireVersion && obj["keyboard"] as? Bool == true
+                self.macSupportsArrangement = macPV >= WireProtocol.arrangementWireVersion && obj["displayArrangement"] as? Bool == true
             }
             if macPV < WireProtocol.minSupportedPeer {
-                let msg = "Duo Display on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
+                let msg = "SideExtend on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
                 DispatchQueue.main.async { self.peerSignal = .updateMac(message: msg) }
             }
         case WireMessage.streamConfig:
@@ -1217,7 +1323,7 @@ final class StreamReceiver: ObservableObject {
         case WireMessage.updateRequired:
             // The Mac refuses this pairing until we update from the App Store.
             let message = obj["message"] as? String
-                ?? "Update Duo Display from \(AppStore.updateSourceName) to keep using your second display."
+                ?? "Update SideExtend from \(AppStore.updateSourceName) to keep using your second display."
             let store = (obj["store"] as? String).flatMap { URL(string: $0) } ?? AppStore.updateURL
             DispatchQueue.main.async { self.peerSignal = .updateReceiver(message: message, storeURL: store) }
         default:
@@ -1397,10 +1503,129 @@ final class StreamReceiver: ObservableObject {
     /// Touch events: x/y normalized [0,1] in video space, origin top-left.
     /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can
     /// measure touch→injection latency without doing its own clock sync.
-    func sendTouch(phase: String, x: Double, y: Double) {
+    @discardableResult
+    func sendTouch(phase: String, x: Double, y: Double,typingIntent:Bool = false) -> Bool {
         var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
+        if phase == "ended",typingIntent,macSupportsKeyboard { msg["keyboardIntent"] = recordKeyboardInteraction() }
         if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
-        sendControl(msg)
+        return sendControl(msg)
+    }
+
+    func resetPhoneArrangementSession() {
+        macSupportsArrangement = false; phoneArrangement = nil; arrangementPending = false
+        arrangementRequestID = nil; arrangementWatchID = nil; arrangementError = nil
+    }
+    func watchPhoneArrangement(_ enabled:Bool,clearError:Bool = true) {
+        guard connected, macSupportsArrangement else { return }
+        if clearError { arrangementError = nil }
+        let id = UUID().uuidString; arrangementWatchID = enabled ? id : nil
+        if enabled { phoneArrangement = nil }
+        sendArrangementRequest(.init(action:enabled ? .subscribe : .unsubscribe,requestID:id,revision:nil,placement:nil))
+        if enabled {
+            DispatchQueue.main.asyncAfter(deadline:.now()+4) { [weak self] in
+                guard let self,self.arrangementWatchID == id,self.phoneArrangement == nil else { return }
+                self.arrangementError = "The Mac has not reported its layout. Wait for the extended display to finish loading, then refresh."
+            }
+        }
+    }
+    func arrangePhone(_ placement:PhoneDisplayPlacement? = nil,undo:Bool = false,revision:String) {
+        guard connected, macSupportsArrangement, !arrangementPending, let report = phoneArrangement,
+              report.revision == revision, report.unavailable == nil, !report.busy else {
+            arrangementError = "The connection or layout changed. Refresh and review the preview again."; return
+        }
+        resetInputs(); arrangementError = nil
+        let id = UUID().uuidString; arrangementRequestID = id; arrangementPending = true
+        sendArrangementRequest(.init(action:undo ? .undo : .place,requestID:id,revision:revision,placement:placement))
+        DispatchQueue.main.asyncAfter(deadline:.now()+8) { [weak self] in
+            guard let self,self.arrangementRequestID == id else { return }
+            self.arrangementPending = false; self.arrangementRequestID = nil
+            self.arrangementError = "Confirmation did not arrive. Refresh the actual layout before trying again; the request was not resent."
+            if self.arrangementWatchID != nil { self.watchPhoneArrangement(true,clearError:false) }
+        }
+    }
+    private func sendArrangementRequest(_ request:PhoneArrangementRequest) {
+        guard let data = try? JSONEncoder().encode(request),var object = try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return }
+        object["type"] = "phoneArrangement"; sendControl(object)
+    }
+    /// Also used for seamless socket adoption, where connected may stay true.
+    func resetPhoneKeyboardSession() {
+        macSupportsShortcutGestures = false;pendingGestureID = nil;probeStart = nil;feedbackState.reset()
+        let unconfirmed = keyboardDelivery.count > 0
+        macSupportsKeyboard = false
+        keyboardPresentation.disconnect(); keyboardSequence = 0; keyboardInteraction = 0; keyboardDelivery.reset()
+        if unconfirmed { keyboardError = "Connection changed before keyboard delivery was confirmed. Check the Mac field before retrying." }
+    }
+    private func recordKeyboardInteraction() -> Int {
+        if keyboardInteraction < Int.max-1 { keyboardInteraction += 1 }
+        keyboardPresentation.recordInteraction(keyboardInteraction)
+        return keyboardInteraction
+    }
+    func showPhoneKeyboard() { keyboardError = nil; keyboardPresentation.openManually() }
+    var resignPhoneKeyboard: (() -> Void)?
+    func hidePhoneKeyboard() { resignPhoneKeyboard?(); keyboardPresentation.dismiss() }
+    func sendKeyboard(_ action: KeyboardCommand.Action, text: String? = nil) {
+        guard macSupportsKeyboard, keyboardPresentation.visible, let focus = keyboardPresentation.focus, focus.allowsTyping else { return }
+        keyboardSequence += 1
+        let command = KeyboardCommand(sequence:keyboardSequence,focus:focus.token,action:action,text:text,manual:keyboardPresentation.manual)
+        guard let data = try? JSONEncoder().encode(command), var object = try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return }
+        guard let conn = connection, keyboardDelivery.register(keyboardSequence,focus:focus.token) else {
+            keyboardError = "Keyboard delivery is delayed. Check the Mac field before retrying."; keyboardPresentation.dismiss(); return
+        }
+        let sequence = keyboardSequence, token = focus.token
+        if action == .enter { object["keyboardIntent"] = recordKeyboardInteraction() }
+        object["type"] = "keyboardInput"; sendControl(object,on:conn)
+        DispatchQueue.main.asyncAfter(deadline:.now()+3) { [weak self,weak conn] in
+            guard let self, let conn, self.connection === conn, self.keyboardDelivery.complete(sequence,focus:token) else { return }
+            self.keyboardError = "Keyboard delivery was not confirmed. Check the Mac field before retrying; text was not resent."
+            self.keyboardPresentation.dismiss()
+        }
+    }
+    func resetInputs() { feedbackState.reset();sendControl(["type": "inputReset"]) }
+
+    var trackpadSpeedLevel: () -> Int = { TrackpadSpeed.load() }
+    var gesturePreferences: (() -> TrackpadGesturePreferences)?
+    func sendTrackpad(_ command: TrackpadCommand) {
+        guard let command = TrackpadSpeed.apply(command, level: trackpadSpeedLevel()) else { return }
+        guard macSupportsTrackpad else { return }
+        var msg: [String: Any] = ["type": "trackpad"]
+        if macSupportsKeyboard {
+            switch command {
+            case .click: msg["keyboardIntent"] = recordKeyboardInteraction()
+            default: break
+            }
+        }
+        switch command {
+        case .move(let x, let y): msg["action"] = "move"; msg["dx"] = x; msg["dy"] = y
+        case .scroll(let x, let y): msg["action"] = "scroll"; msg["dx"] = x; msg["dy"] = y
+        case .click(let n): msg["action"] = "click"; msg["count"] = n
+        case .secondaryClick: msg["action"] = "secondaryClick"
+        case .dragBegan: msg["action"] = "dragBegan"
+        case .dragEnded: msg["action"] = "dragEnded"
+        case .swipe(let fingers,let direction): sendShortcutGesture(fingers:fingers,direction:direction);return
+        }
+        if case .dragBegan = command { hidePhoneKeyboard() }
+        if let offset = clockOffsetMs { msg["t"] = nowMs+offset }
+        let now = ProcessInfo.processInfo.systemUptime
+        if case .move = command,macSupportsShortcutGestures,now-lastProbe >= 0.5 {
+            lastProbe = now;probeSequence += 1;probeStart = (probeSequence,now);msg["probe"] = probeSequence
+        }
+        let accepted = sendControl(msg)
+        if let feedback = feedbackState.trackpad(command,accepted:accepted) { inputFeedback?(feedback) }
+    }
+
+    private func sendShortcutGesture(fingers:Int,direction:TrackpadSwipeDirection) {
+        guard macSupportsShortcutGestures,connected,gestureProfileID != nil || gesturePreferences != nil,
+              let shortcut = (gesturePreferences?() ?? TrackpadGesturePreferences.load(scope:gestureProfileID)).shortcut(fingers:fingers,direction:direction) else { return }
+        guard pendingGestureID == nil else { gestureStatus = "Wait for the previous gesture to finish.";return }
+        gestureSequence += 1
+        let request = TrackpadGestureRequest(id:UUID().uuidString,sequence:gestureSequence,fingers:fingers,direction:direction,shortcut:shortcut)
+        guard let data = try? JSONEncoder().encode(request),var object = try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return }
+        object["type"] = "trackpadGesture";pendingGestureID = request.id;gestureStatus = "Sending shortcut…"
+        guard sendControl(object) else { pendingGestureID = nil;gestureStatus = "Not connected.";return }
+        DispatchQueue.main.asyncAfter(deadline:.now()+2) { [weak self] in
+            guard let self,self.pendingGestureID == request.id else { return }
+            self.pendingGestureID = nil;self.gestureStatus = "No shortcut confirmation. Check the connection before retrying; it was not resent."
+        }
     }
 
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
@@ -1429,12 +1654,13 @@ final class StreamReceiver: ObservableObject {
         sendControl(["type": "proximity", "entering": entering, "x": x, "y": y])
     }
 
+    @discardableResult
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
-                             completion: (() -> Void)? = nil) {
+                             completion: (() -> Void)? = nil) -> Bool {
         guard let conn = conn ?? connection,
               let payload = try? JSONSerialization.data(withJSONObject: message) else {
             completion?()
-            return
+            return false
         }
         var header = UInt32(payload.count).bigEndian
         var frame = Data(bytes: &header, count: 4)
@@ -1443,6 +1669,7 @@ final class StreamReceiver: ObservableObject {
             if let error { Log.info("control send error: \(error)") }
             completion?()
         })
+        return true
     }
 
     // MARK: - Socket read + length-prefixed deframing
@@ -2068,6 +2295,10 @@ final class StreamReceiver: ObservableObject {
             self.connected = value
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
+                self.macSupportsTrackpad = false
+                self.macSupportsShortcutGestures = false;self.pendingGestureID = nil;self.probeStart = nil
+                self.feedbackState.reset();self.timingSamples.removeAll();self.trackpadTimingSummary = "No input timing samples yet"
+                self.resetPhoneKeyboardSession(); self.resetPhoneArrangementSession()
             }
         }
         if !value { setStatus("Ready to connect") }

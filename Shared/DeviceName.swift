@@ -65,7 +65,7 @@ enum DeviceNameText {
 
     private static let genericNames: Set<String> = [
         "iphone", "ipad", "ipod", "ipod touch", "mac", "android", "android device",
-        "device", "duo display", "opendisplay", "iphone / ipad", "wifi device",
+        "device", "sideextend", "side extend", "duo display", "opendisplay", "iphone / ipad", "wifi device",
         "wi-fi device", "localhost", "unknown",
     ]
 

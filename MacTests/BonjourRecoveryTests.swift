@@ -34,6 +34,37 @@ final class BonjourRecoveryTests: XCTestCase {
         XCTAssertTrue(browser.results.isEmpty)
     }
 
+    func testNeverReadyBrowserTimesOutAndRetriesWithoutLeavingStuckStartingUI() async throws {
+        var launches = 0, timeouts = 0
+        let browser = BonjourBrowser(type: "_duodeadline._tcp", retryDelay: 0.04,
+            startupTimeout: 0.04, launch: { _ in launches += 1 })
+        browser.onState = { state in
+            if case .waiting(.posix(.ETIMEDOUT)) = state { timeouts += 1 }
+        }
+        browser.start()
+        let retried = try await eventually { launches >= 2 && timeouts >= 1 }
+        XCTAssertTrue(retried, browser.diagnostic)
+        browser.cancel()
+        let count = launches
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(launches, count, "A canceled startup deadline cannot recreate discovery")
+        XCTAssertEqual(browser.diagnostic, "Stopped")
+    }
+
+    func testReadyEmptyBrowserIsNotReportedAsBlockedOrRestartedByStartupDeadline() async throws {
+        let browser = BonjourBrowser(type: "_duoempty._tcp", startupTimeout: 1)
+        defer { browser.cancel() }
+        browser.start()
+        let ready = try await eventually { browser.diagnostic.contains("ready") }
+        XCTAssertTrue(ready, browser.diagnostic)
+        let generation = browser.generation
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(browser.generation, generation)
+        XCTAssertFalse(browser.diagnostic.contains("timed out"))
+        XCTAssertTrue(browser.results.isEmpty)
+        XCTAssertTrue(DiscoveryGuidance.noPairableMac.contains("does not mean the Mac is not advertising"))
+    }
+
     func testPersistentQuickPairDiscoverySurvivesWindowAndRecoveryWithoutApprovalBypass() async throws {
         let mac = PairingDiscovery(pairingWindow: 0.05)
         let phone = PairingDiscovery()

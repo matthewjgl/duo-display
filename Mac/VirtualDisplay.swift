@@ -24,6 +24,7 @@ final class VirtualDisplay {
     var pixelsHigh: Int { pointsHigh * scale }
 
     private var originRestore: OriginRestore
+    private var phoneArrangementInProgress = false
     private let onOriginChange: ((CGPoint, CGSize) -> Void)?
     /// Called once on the main thread when macOS keeps refusing a 2x target
     /// (or keeps dropping it from the mode list), with the refused size. The
@@ -292,7 +293,17 @@ final class VirtualDisplay {
     /// Arrangement restore + observation (#116): enforce the caller's
     /// device-keyed origin while macOS may still restore its own stale record
     /// for this identity, then report user drags. Policy in `OriginRestore`.
+    /// Remote arrangement uses public Quartz transactions. Pause the existing
+    /// startup restore window so it cannot fight an explicit user placement.
+    func beginPhoneArrangement() { phoneArrangementInProgress = true }
+    func finishPhoneArrangement(persist: Bool) {
+        let actual = CGDisplayBounds(display.displayID)
+        originRestore.rearm(at:actual.origin)
+        phoneArrangementInProgress = false
+        if persist { onOriginChange?(actual.origin,actual.size) }
+    }
     private func manageOrigin() {
+        guard !phoneArrangementInProgress else { return }
         let id = display.displayID
         let origin = CGDisplayBounds(id).origin
         switch originRestore.tick(origin: origin) {

@@ -45,7 +45,7 @@ final class VersionGate: ObservableObject {
     private var peerStatus: Status = .ok
 
     // The fork must never be gated by the upstream app's policy. Configure a
-    // Duo Display endpoint only after its release policy has been published.
+    // SideExtend endpoint only after its release policy has been published.
     private let manifestURL: URL? = (Bundle.main.object(
         forInfoDictionaryKey: "DuoDisplayVersionManifestURL") as? String).flatMap { URL(string: $0) }
 
@@ -98,8 +98,9 @@ final class VersionGate: ObservableObject {
     }
 
     private func branded(_ message: String) -> String {
-        let named = message.replacingOccurrences(of: "OpenDisplay", with: "Duo Display", options: .caseInsensitive)
-            .replacingOccurrences(of: "Open Display", with: "Duo Display", options: .caseInsensitive)
+        let named = message.replacingOccurrences(of: "OpenDisplay", with: "SideExtend", options: .caseInsensitive)
+            .replacingOccurrences(of: "Open Display", with: "SideExtend", options: .caseInsensitive)
+            .replacingOccurrences(of: "Duo Display", with: "SideExtend", options: .caseInsensitive)
         // Older Macs phrase this as an App Store update; route the copy to
         // wherever updateURL actually points.
         return named.replacingOccurrences(of: "the App Store", with: AppStore.updateSourceName)
@@ -130,9 +131,9 @@ final class VersionGate: ObservableObject {
     }
 
     private static let requiredFallback =
-        "This version of Duo Display is no longer supported. Update from \(AppStore.updateSourceName) to keep using your second display."
+        "This version of SideExtend is no longer supported. Update from \(AppStore.updateSourceName) to keep using your second display."
     private static let recommendedFallback =
-        "A newer version of Duo Display is available."
+        "A newer version of SideExtend is available."
 }
 
 /// Numeric dotted-version compare (e.g. "0.10.0" older than "0.11.0"). Missing

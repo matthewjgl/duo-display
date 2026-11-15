@@ -31,7 +31,7 @@ final class DeviceNameTextTests: XCTestCase {
     }
 
     func testGenericNamesIncludingBonjourConflictSuffix() {
-        for name in ["iPhone", "iPad", "iPhone (2)", "ipad (12)", "Duo Display", "iPhone / iPad", "  ", "Mac"] {
+        for name in ["iPhone", "iPad", "iPhone (2)", "ipad (12)", "SideExtend", "Side Extend", "Duo Display", "iPhone / iPad", "  ", "Mac"] {
             XCTAssertTrue(DeviceNameText.isGeneric(name), name)
         }
         XCTAssertTrue(DeviceNameText.isGeneric("Pixel", kind: "Pixel"))

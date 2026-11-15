@@ -2,12 +2,46 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+import zipfile
 
 spec = importlib.util.spec_from_file_location('release_mac', Path(__file__).with_name('mac.py'))
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 class FeedChecks(unittest.TestCase):
+    def test_source_archive_excludes_unlisted_local_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'source/build').mkdir(parents=True)
+            (root / 'source/app.swift').write_text('approved source')
+            (root / 'source/.env').write_text('not for distribution')
+            (root / 'source/build/private-notes.txt').write_text('not for distribution')
+            archive = root / 'source.zip'
+            release.archive_frozen_source(root, {'app.swift': release.sha(root / 'source/app.swift')}, archive)
+            with zipfile.ZipFile(archive) as z:
+                self.assertIn('source/app.swift', z.namelist())
+                self.assertFalse(any('.env' in n or 'private-notes' in n for n in z.namelist()))
+
+    def test_rebrand_preserves_identities_and_historical_product_names(self):
+        current = release.products_for({'brand': 'SideExtend'})
+        previous = release.products_for({})
+        self.assertEqual([p[1] for p in current], ['SideExtend', 'SideExtend Receiver'])
+        self.assertEqual([p[1] for p in previous], ['Duo Display', 'Duo Display Receiver'])
+        for new, old in zip(current, previous):
+            self.assertEqual(new[0], old[0])
+            self.assertEqual(new[2:], old[2:])
+
+    def test_legacy_downloads_keep_exact_signed_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata = {'brand': 'SideExtend', 'assets': {}}
+            for name in ['SideExtend.dmg', 'SideExtendReceiver.dmg']:
+                (root / name).write_bytes(('signed ' + name).encode())
+            release.preserve_download_aliases(root, metadata)
+            self.assertEqual((root / 'DuoDisplay.dmg').read_bytes(), (root / 'SideExtend.dmg').read_bytes())
+            self.assertEqual((root / 'DuoDisplayReceiver.dmg').read_bytes(), (root / 'SideExtendReceiver.dmg').read_bytes())
+            self.assertEqual(metadata['assets']['DuoDisplay.dmg'], release.sha(root / 'SideExtend.dmg'))
+
     def test_build_order_is_numeric_and_normalized(self):
         self.assertGreater(release.build_order('1.10'), release.build_order('1.9'))
         self.assertGreater(release.build_order('2'), release.build_order('1.99'))

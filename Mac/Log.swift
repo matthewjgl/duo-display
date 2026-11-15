@@ -14,20 +14,19 @@ import Foundation
 /// the *oldest* bytes and discard everything recent, which is backwards: when a
 /// report comes in, the useful window is what happened just before the problem.
 enum Log {
-    /// `~/Library/Logs/Duo Display`. The platform convention, and deliberately
+    /// `~/Library/Logs/SideExtend`. The platform convention, and deliberately
     /// not /tmp: macOS clears /tmp on reboot, and rebooting is the first thing
     /// someone tries before filing a bug, so a log there is gone exactly when
     /// it's wanted. Living here also means Console.app lists it under Log
     /// Reports without us doing anything.
     ///
-    /// The folder is named after the app: the sender logs to `Duo Display`,
-    /// the receiver app (a separate bundle sharing this file) to
-    /// `Duo Display Receiver`, so running both on one Mac keeps two logs.
+    /// Keep the pre-rebrand log directories so existing diagnostic history
+    /// stays available. These storage paths are not the application display name.
     private static let directory: URL = {
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library")
         let product = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? ""
-        let folder = product.hasPrefix("Duo Display") ? product : "Duo Display"
+        let folder = product.contains("Receiver") ? "Duo Display Receiver" : "Duo Display"
         return library.appendingPathComponent("Logs/\(folder)", isDirectory: true)
     }()
 
@@ -254,6 +253,6 @@ final class RotatingLogFile {
     }
 
     private static func reportToStandardError(_ message: String) {
-        try? FileHandle.standardError.write(contentsOf: Data("Duo Display log: \(message)\n".utf8))
+        try? FileHandle.standardError.write(contentsOf: Data("SideExtend log: \(message)\n".utf8))
     }
 }

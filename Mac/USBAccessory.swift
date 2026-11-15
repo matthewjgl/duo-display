@@ -68,7 +68,7 @@ enum AOA {
             case .noDevice: return "Android device not attached"
             case .notSupported: return "device does not support USB accessory mode"
             case .notAccessory: return "device did not switch to accessory mode"
-            case .noApp: return "Duo Display did not open on the device"
+            case .noApp: return "SideExtend did not open on the device"
             case .noInterface: return "accessory exposes no bulk endpoints"
             }
         }

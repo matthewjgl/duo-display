@@ -19,9 +19,45 @@ TEAM = '23222L722A'
 ACCOUNT = 'com.matthewjgl.duodisplay.sparkle'
 IDENTITY = f'Developer ID Application: Matthew Gonzalez ({TEAM})'
 PRODUCTS = [
-    ('OpenSidecarMac', 'Duo Display', 'com.matthewjgl.duodisplay.mac', 'appcast.xml', '14.0'),
-    ('OpenSidecarMacReceiver', 'Duo Display Receiver', 'com.matthewjgl.duodisplay.mac.receiver', 'appcast-receiver.xml', '12.0'),
+    ('OpenSidecarMac', 'SideExtend', 'com.matthewjgl.duodisplay.mac', 'appcast.xml', '14.0'),
+    ('OpenSidecarMacReceiver', 'SideExtend Receiver', 'com.matthewjgl.duodisplay.mac.receiver', 'appcast-receiver.xml', '12.0'),
 ]
+LEGACY_PRODUCTS = [
+    (scheme, product.replace('SideExtend', 'Duo Display'), bundle, feed, minimum)
+    for scheme, product, bundle, feed, minimum in PRODUCTS
+]
+
+
+def products_for(metadata):
+    """Resume historical frozen candidates without changing their product names."""
+    return PRODUCTS if metadata.get('brand') == 'SideExtend' else LEGACY_PRODUCTS
+
+
+def preserve_download_aliases(out, metadata):
+    """Keep previous latest/download filenames serving the identical signed DMG."""
+    if metadata.get('brand') != 'SideExtend':
+        return
+    for primary, legacy in [('SideExtend.dmg', 'DuoDisplay.dmg'),
+                            ('SideExtendReceiver.dmg', 'DuoDisplayReceiver.dmg')]:
+        shutil.copy2(out / primary, out / legacy)
+        metadata['assets'][legacy] = sha(out / legacy)
+
+
+def archive_frozen_source(out, source_hashes, destination):
+    """Package approved inputs only, never test output or local release evidence."""
+    with tempfile.TemporaryDirectory(prefix='sideextend-source-') as tmp:
+        source = Path(tmp) / 'source'
+        for name, digest in source_hashes.items():
+            relative = Path(name)
+            if relative.is_absolute() or '..' in relative.parts:
+                raise RuntimeError(f'Invalid frozen source path: {name}')
+            original = out / 'source' / relative
+            if sha(original) != digest:
+                raise RuntimeError(f'Frozen source changed: {name}')
+            target = source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(original, target)
+        run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(source), str(destination))
 
 
 def run(*args, cwd=ROOT, log=None):
@@ -68,7 +104,8 @@ def export_distributions(out):
     options.write_bytes(plistlib.dumps({'destination': 'export', 'method': 'developer-id',
         'signingStyle': 'manual', 'signingCertificate': 'Developer ID Application',
         'teamID': TEAM, 'manageAppVersionAndBuildNumber': False}))
-    for scheme, product, _, _, _ in PRODUCTS:
+    metadata = json.loads((out / 'release.json').read_text())
+    for scheme, product, _, _, _ in products_for(metadata):
         destination = out / 'distribution' / scheme
         app = destination / f'{product}.app'
         if not app.exists():
@@ -141,14 +178,14 @@ def prepare(args):
             hashes[str(rel)] = sha(target)
     save(out / 'source-sha256.json', hashes)
     snapshot = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
-    metadata = {'version': args.version, 'build': args.build, 'team': TEAM,
+    metadata = {'version': args.version, 'build': args.build, 'team': TEAM, 'brand': 'SideExtend',
                 'repository': REPO, 'source_snapshot': snapshot, 'state': 'preparing', 'assets': {}}
     save(out / 'release.json', metadata)
     env = os.environ.copy()
     env['DEVELOPMENT_TEAM'] = TEAM
     subprocess.run(['xcodegen', 'generate'], cwd=source, env=env, check=True)
     derived = out / 'DerivedData'
-    for scheme, product, bundle, feed, minimum in PRODUCTS:
+    for scheme, product, bundle, feed, minimum in products_for(metadata):
         archive = out / f'{scheme}.xcarchive'
         run('xcodebuild', '-project', str(source / 'OpenSidecar.xcodeproj'), '-scheme', scheme,
             '-configuration', 'Release', '-destination', 'generic/platform=macOS',
@@ -210,7 +247,7 @@ def finish_notarization(out, profile):
     source = out / 'source'
     derived = out / 'DerivedData'
     prepared_feeds = []
-    for scheme, product, bundle, feed, minimum in PRODUCTS:
+    for scheme, product, bundle, feed, minimum in products_for(metadata):
         app = out / 'distribution' / scheme / f'{product}.app'
         zipfile = out / f'{product.replace(" ", "")}-distribution-notary.zip'
         if not zipfile.exists():
@@ -252,6 +289,7 @@ def finish_notarization(out, profile):
         metadata['assets'][dmg.name] = sha(dmg)
         metadata['assets'][feed] = sha(out / feed)
         save(out / 'release.json', metadata)
+    preserve_download_aliases(out, metadata)
     metadata['state'] = 'ready-for-draft'
     save(out / 'release.json', metadata)
     print(f'Prepared {out}; source snapshot {metadata["source_snapshot"]}. Nothing published.')
@@ -277,8 +315,15 @@ def upload(args):
         if hashlib.sha256(data).hexdigest() != digest or blobs.get(name) != git_hash:
             raise RuntimeError(f'Frozen source differs from release commit: {name}')
     # Corresponding source is included with the exact binary candidate (GPL).
-    source_zip = out / 'DuoDisplay-Source.zip'
-    run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(out / 'source'), str(source_zip))
+    brand = metadata.get('brand', 'Duo Display')
+    source_zip = out / f'{brand.replace(" ", "")}-Source.zip'
+    archive_frozen_source(out, source_hashes, source_zip)
+    metadata['assets'][source_zip.name] = sha(source_zip)
+    if brand == 'SideExtend':
+        legacy_source = out / 'DuoDisplay-Source.zip'
+        shutil.copy2(source_zip, legacy_source)
+        metadata['assets'][legacy_source.name] = sha(legacy_source)
+    save(out / 'release.json', metadata)
     notes = Path(args.notes).resolve()
     tag = f'v{metadata["version"]}'
     # Reject an existing tag/release: never overwrite a released artifact/feed.
@@ -286,8 +331,8 @@ def upload(args):
     if existing.returncode == 0:
         raise RuntimeError('Release already exists. Inspect it rather than overwriting.')
     run('gh', 'release', 'create', tag, '--repo', REPO, '--target', args.commit,
-        '--draft', '--title', f'Duo Display {metadata["version"]}', '--notes-file', str(notes),
-        *[str(out / n) for n in metadata['assets']], str(source_zip), str(out / 'release.json'))
+        '--draft', '--title', f'{brand} {metadata["version"]} ({metadata["build"]})', '--notes-file', str(notes),
+        *[str(out / n) for n in metadata['assets']], str(out / 'release.json'))
     print(f'Draft created: https://github.com/{REPO}/releases. Not public and not in the update feed.')
 
 
@@ -304,10 +349,20 @@ def publish(args):
         manifest = json.loads((artifact / 'release.json').read_text())
         if args.tag != f'v{manifest["version"]}' or manifest['state'] != 'ready-for-draft':
             raise RuntimeError('Draft tag/manifest mismatch')
+        if manifest.get('brand') == 'SideExtend':
+            branded = {'SideExtend.dmg', 'SideExtendReceiver.dmg', 'SideExtend-Source.zip'}
+            if not branded <= set(manifest['assets']):
+                raise RuntimeError('Branded draft assets are incomplete')
         for name, digest in manifest['assets'].items():
             if sha(artifact / name) != digest:
                 raise RuntimeError(f'Draft asset changed: {name}')
-        for _, product, _, feed, _ in PRODUCTS:
+        if manifest.get('brand') == 'SideExtend':
+            for primary, legacy in [('SideExtend.dmg', 'DuoDisplay.dmg'),
+                                    ('SideExtendReceiver.dmg', 'DuoDisplayReceiver.dmg'),
+                                    ('SideExtend-Source.zip', 'DuoDisplay-Source.zip')]:
+                if sha(artifact / primary) != sha(artifact / legacy):
+                    raise RuntimeError(f'Compatibility download differs: {legacy}')
+        for _, product, _, feed, _ in products_for(manifest):
             validate_feed(artifact / feed, manifest['version'], manifest['build'],
                           artifact / f'{product.replace(" ", "")}.dmg')
     run('gh', 'release', 'edit', args.tag, '--repo', REPO, '--draft=false', '--latest')

@@ -11,11 +11,15 @@ import Foundation
 /// protocol 1 — that's every install in the field that predates the handshake.
 enum WireProtocol {
     /// The protocol version this build speaks.
-    static let version = 3
+    static let version = 7
+    static let gestureWireVersion = 7
 
     /// Protocol version that introduced Apple Pencil / proximity wire messages.
     /// Peers below this get pencil input as legacy `touch` events.
     static let pencilWireVersion = 3
+    static let trackpadWireVersion = 4
+    static let keyboardWireVersion = 5
+    static let arrangementWireVersion = 6
 
     /// Oldest peer protocol version this build still supports. Stays at 1
     /// (support everything) until a deliberate two-phase breaking change

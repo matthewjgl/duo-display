@@ -84,7 +84,7 @@ struct DiagnosticsLogView: View {
                     .font(.largeTitle)
                     .foregroundStyle(.secondary)
                 Text("The log could not be read.")
-                Text("Restart Duo Display and try again.")
+                Text("Restart SideExtend and try again.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

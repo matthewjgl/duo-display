@@ -3,7 +3,7 @@ import SwiftUI
 // MARK: - Receiver panel (issues #82/#17)
 
 /// The receiver-mode sections of the panel: live status, the advertised
-/// name, and how-to copy, grouped into the Duo Display card layout.
+/// name, and how-to copy, grouped into the SideExtend card layout.
 struct ReceiverSections: View {
     @ObservedObject var controller: ReceiverController
     @AppStorage("showAnalytics") private var showAnalytics = false
@@ -30,7 +30,7 @@ struct ReceiverSections: View {
         }
 
         DuoMacCard("Three steps to more room", symbol: "point.3.connected.trianglepath.dotted") {
-            Label("Open Duo Display on the Mac you want to extend.", systemImage: "1.circle")
+            Label("Open SideExtend on the Mac you want to extend.", systemImage: "1.circle")
             Label("Join the same network, then choose this Mac and click Connect.", systemImage: "2.circle")
             Label("Use the green window button here for full screen.", systemImage: "3.circle")
         }
@@ -94,8 +94,9 @@ private struct ReceiverStatusSection: View {
     }
 
     private func duoMessage(_ message: String) -> String {
-        message.replacingOccurrences(of: "OpenDisplay", with: "Duo Display", options: .caseInsensitive)
-            .replacingOccurrences(of: "Open Display", with: "Duo Display", options: .caseInsensitive)
+        message.replacingOccurrences(of: "OpenDisplay", with: "SideExtend", options: .caseInsensitive)
+            .replacingOccurrences(of: "Open Display", with: "SideExtend", options: .caseInsensitive)
+            .replacingOccurrences(of: "Duo Display", with: "SideExtend", options: .caseInsensitive)
     }
 }
 
