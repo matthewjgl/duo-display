@@ -31,6 +31,7 @@ final class PairingApprovalSnapshotTests: XCTestCase {
     func testTrackpadSpeedControlNativeRender() throws {
         let root = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("build/followup-input-20261111")
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
         for width in [320.0,430.0] {
             let renderer = ImageRenderer(content:TrackpadSpeedControl().padding(20)
                 .frame(width:width).background(Color(nsColor:.windowBackgroundColor)))

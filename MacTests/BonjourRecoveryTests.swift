@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 import Network
 import AVFoundation
@@ -14,7 +15,7 @@ final class BonjourRecoveryTests: XCTestCase {
     }
 
     func testFailedBrowserRetriesButPolicyDenialDoesNotSpinAndStopRetiresRetry() async throws {
-        let browser = BonjourBrowser(type: "_duorecovery._tcp", retryDelay: 0.05)
+        let browser = BonjourBrowser(type: "_duorecovery._tcp", retryDelay: 0.05, watchesPath: false)
         defer { browser.cancel() }
         browser.start()
         let ready = try await eventually { browser.diagnostic.contains("ready") }
@@ -52,7 +53,7 @@ final class BonjourRecoveryTests: XCTestCase {
     }
 
     func testReadyEmptyBrowserIsNotReportedAsBlockedOrRestartedByStartupDeadline() async throws {
-        let browser = BonjourBrowser(type: "_duoempty._tcp", startupTimeout: 1)
+        let browser = BonjourBrowser(type: "_duoempty._tcp", startupTimeout: 1, watchesPath: false)
         defer { browser.cancel() }
         browser.start()
         let ready = try await eventually { browser.diagnostic.contains("ready") }
@@ -66,8 +67,8 @@ final class BonjourRecoveryTests: XCTestCase {
     }
 
     func testPersistentQuickPairDiscoverySurvivesWindowAndRecoveryWithoutApprovalBypass() async throws {
-        let mac = PairingDiscovery(pairingWindow: 0.05)
-        let phone = PairingDiscovery()
+        let mac = PairingDiscovery(pairingWindow: 0.05, watchesPath: false)
+        let phone = PairingDiscovery(watchesPath: false)
         defer { mac.stop(); phone.stop() }
         let name = "Duo Persistent " + UUID().uuidString.prefix(8)
         mac.advertise(name: name, persistent: true); phone.browse()
@@ -93,14 +94,21 @@ final class BonjourRecoveryTests: XCTestCase {
         let receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(), deviceKind: "iPhone", fallbackServiceName: "Recovery QA")
         let name = "Duo Receiver " + UUID().uuidString.prefix(8)
         receiver.setInitialName(name, source: nil)
-        let browser = BonjourBrowser(type: "_opensidecar._tcp")
+        let browser = BonjourBrowser(type: "_opensidecar._tcp", watchesPath: false)
         defer { browser.cancel(); receiver.stop() }
-        browser.start(); receiver.start(port: UInt16.random(in: 49000...55000))
+        browser.start(); receiver.start(port: ReceiverRobustnessTests.freePort())
         func found() -> Bool { browser.results.contains { if case .service(let n,_,_,_) = $0.endpoint { return n == name }; return false } }
         let advertised = try await eventually { found() && receiver.discoveryDiagnostic.contains("registered") }
         XCTAssertTrue(advertised, receiver.discoveryDiagnostic)
-        let result = try XCTUnwrap(browser.results.first { if case .service(let n,_,_,_) = $0.endpoint { return n == name }; return false })
-        let c = NWConnection(to: result.endpoint, using: .tcp)
+        // A phone now rejects all unauthenticated LAN streams. Exercise the
+        // surviving stream through the same paired TLS admission as the app,
+        // while independently checking real Bonjour registration/recovery.
+        let key = SymmetricKey(size: .bits256)
+        let secureReady = expectation(description: "paired receiver ready")
+        var securePort: NWEndpoint.Port?
+        try receiver.startPairedStream(key: key, identity: name, onReady: { securePort = $0; secureReady.fulfill() })
+        await fulfillment(of: [secureReady], timeout: 5)
+        let c = NWConnection(host: "127.0.0.1", port: try XCTUnwrap(securePort), using: PairedTransport.parameters(key: key, identity: name))
         defer { c.cancel() }
         let hello = expectation(description: "real receiver hello before re-registration")
         c.stateUpdateHandler = { state in
@@ -120,5 +128,21 @@ final class BonjourRecoveryTests: XCTestCase {
         receiver.ensureListening()
         let foreground = try await eventually { found() && receiver.discoveryDiagnostic.contains("registered") }
         XCTAssertTrue(foreground, "Foreground must restore a closed listener")
+    }
+
+    /// Spurious identical path updates must not restart discovery (build14/15
+    /// preflight flakes, and the pairing advertiser withdrawal they caused).
+    nonisolated func testPathFilterIgnoresIdenticalUpdatesButReportsRealChanges() {
+        let filter = PathChangeFilter()
+        let wifi = PathSignature(satisfied: true, interfaces: ["en0:wifi", "lo0:loopback"], gateways: ["192.168.1.1:0"])
+        XCTAssertFalse(filter.changed(wifi), "first update is the baseline")
+        XCTAssertFalse(filter.changed(wifi))
+        XCTAssertFalse(filter.changed(PathSignature(satisfied: true, interfaces: ["lo0:loopback", "en0:wifi"], gateways: ["192.168.1.1:0"])),
+                       "interface order is not a change")
+        XCTAssertTrue(filter.changed(PathSignature(satisfied: true, interfaces: ["en0:wifi", "lo0:loopback", "utun4:other"], gateways: ["192.168.1.1:0"])))
+        XCTAssertTrue(filter.changed(PathSignature(satisfied: true, interfaces: ["en0:wifi", "lo0:loopback", "utun4:other"], gateways: ["10.0.0.1:0"])),
+                      "roaming to another network changes the gateway")
+        XCTAssertTrue(filter.changed(PathSignature(satisfied: false, interfaces: [], gateways: [])))
+        XCTAssertTrue(filter.changed(wifi))
     }
 }

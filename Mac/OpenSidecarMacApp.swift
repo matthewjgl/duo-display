@@ -632,6 +632,11 @@ final class SenderController: ObservableObject {
         for result in discovered {
             let target = ConnectionTarget.wifi(result)
             let id = txtID(of: result)
+            // A remembered Bonjour/install ID is copyable metadata, not trust.
+            // Only an existing Keychain-bound peer may reconnect unattended.
+            let boundPeer = id.flatMap { pairedRoutes[$0]?.peer
+                ?? (UserDefaults.standard.dictionary(forKey: "duo.receiverPairBindings.v1") as? [String: String])?[$0] }
+            guard let boundPeer, (try? SecurePairingKeyStore.load(peerID: boundPeer)) != nil else { continue }
             let remembered = wifiRemembered.contains(target.sessionID)
             // One-time migration: a device the user connected over Wi-Fi
             // before per-device setup existed keeps reconnecting at launch.
@@ -943,6 +948,13 @@ final class SenderController: ObservableObject {
             }
             return nil
         }()
+        if paired == nil, case .wifi(let result) = target,
+           case .bonjour(let txt) = result.metadata, txt["auth"] == "paired2" {
+            lastConnectionGuidance = ConnectionGuidance(
+                finding: "This device needs secure pairing before Wi-Fi streaming.",
+                action: "On the phone, choose this Mac, compare the code on both screens and approve. Then use Connect on either device. Update SideExtend on both devices if pairing asks you to update.")
+            return
+        }
         let id = target.sessionID
         if userInitiated, case .usb(let udid?) = target,
            installIDByUDID[udid] == nil,
@@ -2029,6 +2041,11 @@ struct SessionRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+                if !session.onUSB && session.pairedPeerID == nil {
+                    Label("Not encrypted · legacy receiver", systemImage: "lock.open")
+                        .font(.caption).foregroundStyle(.orange)
+                        .help("Manual legacy network video is unencrypted. Use only on a trusted network; remote input is disabled. Phone/tablet Wi-Fi requires pairing.")
+                }
                 // Live numbers measured on the phone, refreshed ~1 Hz while
                 // the menu is open. "—" until the phone reports (or if it is
                 // an older app that never does).
@@ -2233,7 +2250,9 @@ struct DisplaySizePicker: View {
                 }
                 Toggle("Allow Wi-Fi handoff", isOn: Binding(
                     get: { session.wirelessHandoffAllowed }, set: { session.allowWirelessHandoff($0) }))
-                Text("Wi-Fi is not encrypted. Allow only on a trusted network. USB and Wi-Fi must report the same receiver identity.")
+                Text(session.pairedPeerID != nil
+                     ? "Wi-Fi uses this device’s pairing key for encryption. USB and Wi-Fi must report the same receiver identity."
+                     : "This device is not paired, so its Wi-Fi stream is not encrypted. Allow only on a trusted network. USB and Wi-Fi must report the same receiver identity.")
                     .font(.caption).foregroundStyle(.secondary).frame(maxWidth: 300)
                 Text("Scaling and position are remembered. Rotation follows the receiver’s current orientation to keep video and touch aligned.")
                     .font(.caption).foregroundStyle(.secondary).frame(maxWidth: 300)

@@ -79,8 +79,8 @@ enum PhoneArrangementGeometry {
         return reached.count == displays.count
     }
     static func unavailable(_ topology:PhoneDisplayTopology,target:UInt32?) -> String? {
-        guard let target, let phone = topology.displays.first(where:{$0.id == target}) else { return "This iPhone’s extended display is not available. Reconnect and try again." }
-        guard topology.main != target else { return "This iPhone is the primary display. Choose a Mac display as primary on the Mac first." }
+        guard let target, let phone = topology.displays.first(where:{$0.id == target}) else { return "This device’s extended display is not available. Reconnect and try again." }
+        guard topology.main != target else { return "This device is the primary display. Choose a Mac display as primary on the Mac first." }
         guard !topology.displays.contains(where: \.mirrored) else { return "Phone arrangement requires an extended desktop. Disable display mirroring on the Mac first." }
         guard valid(phone.frame),validLayout(topology) else { return "The current layout has overlaps or disconnected edges. Correct it on the Mac before arranging from the phone." }
         return nil
@@ -162,7 +162,7 @@ final class PhoneArrangementController {
             desired = undo.before
         default:return current
         }
-        if desired == before { return snapshot(context,message:"This iPhone is already in that position.") }
+        if desired == before { return snapshot(context,message:"This device is already in that position.") }
         guard PhoneArrangementGeometry.validLayout(desired), desired.main == before.main else { return snapshot(context,message:"The proposed layout is no longer safe. Preview another placement.") }
         busy = true
         defer { busy = false }

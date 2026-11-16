@@ -188,3 +188,86 @@ final class MultiFingerTests:XCTestCase {
         try data.write(to:out.appendingPathComponent("synthetic-pointer-measurement.json"))
     }
 }
+
+final class WirelessInputQueueTests: XCTestCase {
+    private func move(_ x: Double, _ y: Double = 0) -> [String: Any] { ["type":"trackpad","action":"move","dx":x,"dy":y,"t":1000.0] }
+    private func decoded(_ frame: Data) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? [String: Any])
+    }
+    func testDelayedSocketCoalescesWithoutLosingDisplacementOrCrossingClickDragBarriers() throws {
+        var writes:[Data] = [], callbacks:[(Bool)->Void] = [], failures = 0
+        let box = InputControlOutbox(clock:{0},write:{writes.append($0);callbacks.append($1)},failure:{failures += 1})
+        for _ in 0..<120 { XCTAssertTrue(box.enqueue(move(1))) }
+        XCTAssertEqual(writes.count,1,"Backpressure bounds submissions to the socket")
+        box.enqueue(["type":"trackpad","action":"dragBegan"])
+        box.enqueue(move(3)); box.enqueue(move(4))
+        box.enqueue(["type":"trackpad","action":"dragEnded"])
+        box.enqueue(["type":"trackpad","action":"click","count":2])
+        while !callbacks.isEmpty { callbacks.removeFirst()(true) }
+        let objects = try writes.map(decoded)
+        XCTAssertEqual(objects.compactMap{$0["action"] as? String},["move","move","dragBegan","move","dragEnded","click"])
+        XCTAssertEqual(objects.compactMap{$0["dx"] as? Double}.reduce(0,+),127)
+        XCTAssertEqual(failures,0)
+        // Synthetic stalled-writer evidence, not physical network latency.
+        let proof:[String:Any] = ["scenario":"120 same-direction moves queued while first socket write is held; release before 25ms", "old_socket_submissions":120,"new_movement_submissions":2,"displacement_points":120,"artificial_batch_delay_ms":0]
+        let url = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("build/sideextend-network-20261115/outbox-measurement.json")
+        try FileManager.default.createDirectory(at:url.deletingLastPathComponent(),withIntermediateDirectories:true)
+        try JSONSerialization.data(withJSONObject:proof,options:.prettyPrinted).write(to:url)
+    }
+    func testDirectionChangesProbesLimitsAndOldTimestampAreNotLost() throws {
+        var writes:[Data] = [], callbacks:[(Bool)->Void] = [], now = 0.0
+        let box = InputControlOutbox(clock:{now},write:{writes.append($0);callbacks.append($1)},failure:{XCTFail()})
+        box.enqueue(move(1));box.enqueue(move(2000));box.enqueue(move(100));box.enqueue(move(-2))
+        var probe = move(-3);probe["probe"] = 7;box.enqueue(probe)
+        now = 0.03;box.enqueue(move(-4))
+        while !callbacks.isEmpty { callbacks.removeFirst()(true) }
+        let objects = try writes.map(decoded)
+        XCTAssertEqual(objects.compactMap{$0["dx"] as? Double},[1,2000,100,-2,-3,-4])
+        XCTAssertEqual(objects[4]["probe"] as? Int,7)
+        XCTAssertTrue(objects.allSatisfy{($0["t"] as? Double)==1000})
+    }
+    func testStaleMotionIsNotReplayedButReleaseResetAndCompletionSurvive() throws {
+        var writes:[Data] = [], callbacks:[(Bool)->Void] = [], now = 0.0, finished = false
+        let box = InputControlOutbox(clock:{now},write:{writes.append($0);callbacks.append($1)},failure:{XCTFail()})
+        box.enqueue(move(1));box.enqueue(move(2));box.enqueue(["type":"trackpad","action":"dragEnded"])
+        box.enqueue(["type":"inputReset"],completion:{finished=true})
+        now = 0.3
+        while !callbacks.isEmpty { callbacks.removeFirst()(true) }
+        XCTAssertEqual(writes.count,3); XCTAssertTrue(finished)
+        XCTAssertEqual(try decoded(writes[1])["action"] as? String,"dragEnded")
+        XCTAssertEqual(try decoded(writes[2])["type"] as? String,"inputReset")
+    }
+    func testFailureOverflowAndSessionReplacementNeverDrainOldInput() {
+        for replacement in [true,false] {
+            var callbacks:[(Bool)->Void] = [], writes = 0, failures = 0
+            let box = InputControlOutbox(write:{_,done in writes += 1; callbacks.append(done)},failure:{failures += 1})
+            box.enqueue(move(1));box.enqueue(["type":"trackpad","action":"click"])
+            if replacement { box.invalidate() }
+            callbacks.removeFirst()(!replacement ? false : true)
+            XCTAssertEqual(writes,1);XCTAssertEqual(failures,replacement ? 0 : 1)
+            XCTAssertFalse(box.enqueue(move(2)))
+        }
+        var failures = 0
+        let box = InputControlOutbox(write:{_,_ in},failure:{failures += 1})
+        for _ in 0..<130 { box.enqueue(["type":"inputReset"]) }
+        XCTAssertEqual(failures,1)
+    }
+    func testFramingFragmentationBatchesMalformedLengthsAndConnectionScope() throws {
+        let objects = [move(1),["type":"trackpad","action":"click","count":1],move(2)]
+        var wire = Data(), payloads:[Data] = []
+        for object in objects {
+            let payload = try JSONSerialization.data(withJSONObject:object);payloads.append(payload)
+            var n = UInt32(payload.count).bigEndian;wire.append(Data(bytes:&n,count:4));wire.append(payload)
+        }
+        var batch = InputControlFrames();XCTAssertEqual(try batch.append(wire),payloads)
+        var fragments = InputControlFrames(), results:[Data] = []
+        for byte in wire { results += try fragments.append(Data([byte])) }
+        XCTAssertEqual(results,payloads)
+        for length:UInt32 in [0,1 << 20,UInt32.max] {
+            var invalid = length.bigEndian, frames = InputControlFrames()
+            XCTAssertThrowsError(try frames.append(Data(bytes:&invalid,count:4)))
+        }
+        var old = InputControlFrames();_ = try old.append(wire.prefix(3))
+        var new = InputControlFrames();XCTAssertEqual(try new.append(wire),payloads)
+    }
+}

@@ -138,6 +138,16 @@ final class StreamReceiver: ObservableObject {
     @Published private(set) var macSupportsKeyboard = false
     @Published private(set) var keyboardPresentation = KeyboardPresentationState()
     @Published private(set) var keyboardError: String?
+    private var keyboardNotice = ExpiringNotice()
+    /// Main thread. Shown briefly over the desktop, then cleared (tap clears too).
+    func showKeyboardError(_ message: String?) {
+        let token = keyboardNotice.show(message); keyboardError = keyboardNotice.text
+        guard let token else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + ExpiringNotice.lifetime) { [weak self] in
+            guard let self else { return }
+            self.keyboardNotice.expire(token); self.keyboardError = self.keyboardNotice.text
+        }
+    }
     private var keyboardSequence = 0
     private var keyboardInteraction = 0
     private var keyboardDelivery = KeyboardDeliveryLedger()
@@ -166,6 +176,10 @@ final class StreamReceiver: ObservableObject {
     private var pairedConnection: NWConnection?
     @Published private(set) var pairedSession = false
     private var pendingPairedConnections: [NWConnection] = []
+    /// Set while the device is locked (enterSleep): the paired TLS listener
+    /// stays registered for wake, but must not adopt a redialing Mac and
+    /// rebuild its display on a screen nobody can see. Receive queue.
+    private var pairedAdmissionSuspended = false
 
     /// Local integration entry point; the pairing UI must call this only for
     /// a verified Keychain peer. Separate TLS port preserves usbmux on 9000.
@@ -201,13 +215,16 @@ final class StreamReceiver: ObservableObject {
             self.pairedLANRequired = true
             secure.newConnectionHandler = { [weak self, weak secure] candidate in
                 guard let self, let secure, self.pairedListener === secure else { candidate.cancel(); return }
+                guard !self.pairedAdmissionSuspended else { candidate.cancel(); return }
                 guard self.pendingPairedConnections.count < 8 else { candidate.cancel(); return }
                 self.pendingPairedConnections.append(candidate)
                 // NWConnection.ready is reached only after the TLS PSK handshake.
                 candidate.stateUpdateHandler = { [weak self, weak secure] state in
-                    guard let self, let secure, self.pairedListener === secure else { candidate.cancel(); return }
+                    guard let self else { candidate.cancel(); return }
+                    self.onVideoQueue {
+                    guard let secure, self.pairedListener === secure else { candidate.cancel(); return }
                     if case .ready = state {
-                        guard authorize() else { candidate.cancel(); self.pendingPairedConnections.removeAll { $0 === candidate }; return }
+                        guard authorize(), !self.pairedAdmissionSuspended else { candidate.cancel(); self.pendingPairedConnections.removeAll { $0 === candidate }; return }
                         guard self.pendingPairedConnections.contains(where: { $0 === candidate }) else {
                             candidate.cancel(); return
                         }
@@ -217,8 +234,9 @@ final class StreamReceiver: ObservableObject {
                         self.cursorListenerReady = false
                         self.adopt(candidate, authenticated: true)
                     }
+                    }
                 }
-                candidate.start(queue: self.queue)
+                candidate.start(queue: self.inputIOQueue)
                 self.queue.asyncAfter(deadline: .now() + 15) {
                     self.pendingPairedConnections.removeAll { $0 === candidate }
                     if candidate !== self.connection { candidate.cancel() }
@@ -270,7 +288,15 @@ final class StreamReceiver: ObservableObject {
     @Published private(set) var discoveryDiagnostic = "Not listening"
     private var advertisementRegistered = false
 
-    private var connection: NWConnection?
+    // `connection`, the clock offset and the hello inputs are read by app-thread
+    // senders (touch, panel changes) while the receive queue replaces them.
+    private let stateLock = NSLock()
+    private func locked<T>(_ body: () -> T) -> T { stateLock.lock(); defer { stateLock.unlock() }; return body() }
+    private var connectionStorage: NWConnection?
+    private var connection: NWConnection? {
+        get { locked { connectionStorage } }
+        set { locked { connectionStorage = newValue } }
+    }
     // Cursor side channel: UDP on port+1. Cursor positions ride TCP behind
     // multi-hundred-KB video frames, so over WiFi one late frame stalls the
     // cursor with it (head-of-line blocking). UDP datagrams skip that queue.
@@ -311,6 +337,19 @@ final class StreamReceiver: ObservableObject {
     private var cursorLostThisWindow = 0
     private var cursorPort: UInt16 { port &+ 1 }
     private let queue = DispatchQueue(label: "receiver.video")
+    private let queueKey = DispatchSpecificKey<Bool>()
+    // Input shares its admitted socket, not the video work queue.
+    // NWConnection invokes write completions on its start queue: running those
+    // behind decode/format setup stalls the serial input outbox and batches
+    // pointer movement even when the network is healthy.
+    private let inputIOQueue = DispatchQueue(label: "receiver.input-io", qos: .userInteractive)
+    private func onVideoQueue(_ work: @escaping () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) == true { work() }
+        else { queue.async(execute: work) }
+    }
+    private let controlOutboxLock = NSLock()
+    private var controlOutboxes: [ObjectIdentifier: (connection: NWConnection, writer: InputControlOutbox)] = [:]
+
     private var buffer = Data()
     private var formatDesc: CMVideoFormatDescription?
     #if DEBUG
@@ -343,7 +382,11 @@ final class StreamReceiver: ObservableObject {
     // Clock sync (NTP-style): offset = macClock − phoneClock, taken from the
     // ping/pong sample with the lowest RTT (least asymmetric).
     private var offsetSamples: [(rtt: Double, offset: Double)] = []
-    private var clockOffsetMs: Double?
+    private var clockOffsetStorage: Double?
+    private var clockOffsetMs: Double? {
+        get { locked { clockOffsetStorage } }
+        set { locked { clockOffsetStorage = newValue } }
+    }
     private var lastRttMs = 0.0
     private var e2eWindow: [Double] = []        // capture→display, ms
     private var encodeWindow: [Double] = []     // capture→socket on the Mac, ms
@@ -415,14 +458,24 @@ final class StreamReceiver: ObservableObject {
     /// message so it can size the virtual display. Follows the window: a
     /// rotation, a fold or a multitasking resize re-announces it and the Mac
     /// rebuilds the virtual display to match.
-    private(set) var devicePixelsWide = 0
-    private(set) var devicePixelsHigh = 0
-    var deviceScale: Double = 2
+    /// Everything `hello` announces about this receiver, updated atomically.
+    private struct HelloInputs {
+        var pixelsWide = 0, pixelsHigh = 0
+        var scale: Double = 2
+        var panel: PanelAnnouncement?
+        var displayMaxFrameRate = 60
+        var hevc: VideoCapability?
+        var maxEncodeWide: Int?, maxEncodeHigh: Int?
+        var maxPixelsPerSecond: Int?
+    }
+    private var helloInputs = HelloInputs()
+    private var inputsSnapshot: HelloInputs { locked { helloInputs } }
+    var devicePixelsWide: Int { inputsSnapshot.pixelsWide }
+    var devicePixelsHigh: Int { inputsSnapshot.pixelsHigh }
+    var deviceScale: Double { inputsSnapshot.scale }
     /// `hello.panel` (PROTOCOL.md 6.7): physical pixels, real scale and, on a
     /// Mac, its own desktop size, in the current orientation. nil derives it
     /// from the legacy fields above, which are the panel's facts on iOS.
-    private var panelOverride: PanelAnnouncement?
-    private var displayMaxFrameRate = 60
     // Name advertised over Bonjour for the Mac's WiFi picker. iOS 16+ returns
     // a generic "iPhone" from UIDevice.current.name (the user-assigned name
     // needs an entitlement Apple gates behind approval and personal teams
@@ -452,13 +505,10 @@ final class StreamReceiver: ObservableObject {
     /// platform app decides, from its hardware decoder and tested limits.
     /// In the current orientation (PROTOCOL.md 6.5): a rotating receiver
     /// swaps them through `setDecodeLimits`.
-    private var hevcCapability: VideoCapability?
-    private var maxEncodeWide: Int?
-    private var maxEncodeHigh: Int?
+    private var hevcCapability: VideoCapability? { inputsSnapshot.hevc }
     /// Decoder throughput ceiling advertised in `hello.videoCaps`
     /// (PROTOCOL.md 6.5). The sender keeps the raster and lowers the frame
     /// rate to stay under it. nil = advertise none.
-    private var maxPixelsPerSecond: Int?
     /// What to advertise when the user-set service name is empty.
     private let fallbackServiceName: String
 
@@ -478,6 +528,7 @@ final class StreamReceiver: ObservableObject {
 
     private var advertisedService: NWListener.Service {
         var txt = NWTXTRecord()
+        if deviceKind != "Mac" { txt["auth"] = "paired2" }
         txt["id"] = Self.installID
         txt["pv"] = String(WireProtocol.version)   // issue #132
         if let nameSource {
@@ -530,19 +581,26 @@ final class StreamReceiver: ObservableObject {
     func setPanel(pixelsWide w: Int, pixelsHigh h: Int, scale: Double,
                   panel: PanelAnnouncement? = nil, displayMaxFrameRate rate: Int? = nil,
                   limitsChanged: Bool = false) {
-        let rate = rate.map { max(1, $0) } ?? displayMaxFrameRate
-        guard w > 0, h > 0,
-              w != devicePixelsWide || h != devicePixelsHigh || scale != deviceScale
-                || panel != panelOverride || rate != displayMaxFrameRate || limitsChanged
-        else { return }
-        devicePixelsWide = w
-        devicePixelsHigh = h
-        deviceScale = scale
-        panelOverride = panel
-        displayMaxFrameRate = rate
+        let changed: Int? = locked {
+            let rate = rate.map { max(1, $0) } ?? helloInputs.displayMaxFrameRate
+            let i = helloInputs
+            guard w > 0, h > 0,
+                  w != i.pixelsWide || h != i.pixelsHigh || scale != i.scale
+                    || panel != i.panel || rate != i.displayMaxFrameRate || limitsChanged
+            else { return nil }
+            helloInputs.pixelsWide = w; helloInputs.pixelsHigh = h; helloInputs.scale = scale
+            helloInputs.panel = panel; helloInputs.displayMaxFrameRate = rate
+            return rate
+        }
+        guard let rate = changed else { return }
         Log.info("panel changed -> \(w)x\(h) @\(scale)x \(rate) fps"
             + (panel.map { " (panel \($0))" } ?? ""))
-        if let connection { sendHello(on: connection) }
+        resendHello()
+    }
+
+    /// hello also touches queue-confined session state (cursor port, addrs).
+    private func resendHello() {
+        queue.async { if let connection = self.connection { self.sendHello(on: connection) } }
     }
 
     /// Decode limits in the current orientation (PROTOCOL.md 6.5). Does not
@@ -552,29 +610,33 @@ final class StreamReceiver: ObservableObject {
     @discardableResult
     func setDecodeLimits(maxEncodeWide wide: Int?, maxEncodeHigh high: Int?,
                          hevc: VideoCapability?) -> Bool {
-        guard wide != maxEncodeWide || high != maxEncodeHigh || hevc != hevcCapability
-        else { return false }
-        maxEncodeWide = wide
-        maxEncodeHigh = high
-        hevcCapability = hevc
-        return true
+        locked {
+            guard wide != helloInputs.maxEncodeWide || high != helloInputs.maxEncodeHigh || hevc != helloInputs.hevc
+            else { return false }
+            helloInputs.maxEncodeWide = wide; helloInputs.maxEncodeHigh = high; helloInputs.hevc = hevc
+            return true
+        }
     }
 
     /// Hardware decode budget in encoded pixels per second, for silicon that
     /// cannot sustain its own panel at 60 fps. Re-sends hello if connected.
     func setDecodeBudget(maxPixelsPerSecond pixelsPerSecond: Int?) {
         let value = pixelsPerSecond.map { max(4, $0) }
-        guard value != maxPixelsPerSecond else { return }
-        maxPixelsPerSecond = value
-        if let connection { sendHello(on: connection) }
+        let changed: Bool = locked {
+            guard value != helloInputs.maxPixelsPerSecond else { return false }
+            helloInputs.maxPixelsPerSecond = value; return true
+        }
+        if changed { resendHello() }
     }
 
     /// Physical presentation ceiling, separate from decoder capability.
     func setDisplayMaxFrameRate(_ framesPerSecond: Int) {
         let value = max(1, framesPerSecond)
-        guard value != displayMaxFrameRate else { return }
-        displayMaxFrameRate = value
-        if let connection { sendHello(on: connection) }
+        let changed: Bool = locked {
+            guard value != helloInputs.displayMaxFrameRate else { return false }
+            helloInputs.displayMaxFrameRate = value; return true
+        }
+        if changed { resendHello() }
     }
 
     init(displayLayer: AVSampleBufferDisplayLayer, deviceKind: String,
@@ -582,15 +644,24 @@ final class StreamReceiver: ObservableObject {
          maxEncodeWide: Int? = nil, maxEncodeHigh: Int? = nil,
          hevcCapability: VideoCapability? = nil) {
         self.displayLayer = displayLayer
-        self.hevcCapability = hevcCapability
+        queue.setSpecific(key: queueKey, value: true)
         self.deviceKind = deviceKind
+        // Phone/tablet LAN sessions ALWAYS require a verified paired TLS peer,
+        // including before any pairing exists. OS-forwarded USB remains valid.
+        // The legacy Mac receiver has a separate deployment/compatibility path.
+        self.pairedLANRequired = deviceKind != "Mac"
         self.fallbackServiceName = fallbackServiceName
-        self.maxEncodeWide = maxEncodeWide
-        self.maxEncodeHigh = maxEncodeHigh
+        helloInputs.hevc = hevcCapability
+        helloInputs.maxEncodeWide = maxEncodeWide
+        helloInputs.maxEncodeHigh = maxEncodeHigh
         displayLayer.videoGravity = .resizeAspect
     }
 
     #if DEBUG
+    /// Deterministic integration fixture for a decoder/format-setup stall.
+    /// Executes on the actual video/state queue; never ships in Release.
+    func debugEnqueueVideoWork(_ work: @escaping () -> Void) { queue.async(execute: work) }
+
     /// Set by the simulator UI harness: no listener, no Bonjour, so a real
     /// Mac can never connect to a harness run.
     private(set) var debugOffline = false
@@ -656,6 +727,7 @@ final class StreamReceiver: ObservableObject {
         if debugOffline { return }
         #endif
         queue.async {
+            self.pairedAdmissionSuspended = false
             if self.closingSession { self.resumeDiscoveryAfterClose = true; return }
             self.discoveryActive = true
             self.watchDiscoveryPath()
@@ -678,9 +750,9 @@ final class StreamReceiver: ObservableObject {
     private func watchDiscoveryPath() {
         guard discoveryPath == nil else { return }
         let monitor = NWPathMonitor(); discoveryPath = monitor
-        var initial = true
-        monitor.pathUpdateHandler = { [weak self] _ in
-            if initial { initial = false; return }
+        let filter = PathChangeFilter()
+        monitor.pathUpdateHandler = { [weak self] update in
+            guard filter.changed(update) else { return }
             guard let self, self.discoveryActive else { return }
             self.discoveryPolicyDenied = false
             self.scheduleDiscoveryRetry(delay: 0.5)
@@ -730,6 +802,10 @@ final class StreamReceiver: ObservableObject {
     /// display before anyone can see it. ensureListening() re-arms
     /// everything when the scene becomes active again.
     func enterSleep(completion: (() -> Void)? = nil) {
+        queue.async {
+            self.pairedAdmissionSuspended = true
+            self.pendingPairedConnections.forEach { $0.cancel() }; self.pendingPairedConnections.removeAll()
+        }
         closeSession(announcing: WireMessage.sleeping,
                      status: "Asleep — resumes on wake", completion: completion)
     }
@@ -810,7 +886,9 @@ final class StreamReceiver: ObservableObject {
         }
         cursorListener = udp
         udp.newConnectionHandler = { [weak self] conn in
-            guard let self, self.cursorListener === udp, !self.pairedLANRequired else { conn.cancel(); return }
+            guard let self, self.cursorListener === udp,
+                  Self.allowsPlainChannel(endpoint: conn.endpoint, requiresPairing: self.pairedLANRequired),
+                  self.pairedConnection == nil else { conn.cancel(); return }
             // A UDP "connection" is one remote host:port flow. The newest
             // one is the live sender (a rebuilt sender socket gets a fresh
             // ephemeral port) and starts its sequence over.
@@ -942,6 +1020,11 @@ final class StreamReceiver: ObservableObject {
         }
         current.newConnectionHandler = { [weak self, weak current] conn in
             guard let self, let current, self.listener === current, self.discoveryActive else { conn.cancel(); return }
+            guard Self.allowsPlainChannel(endpoint: conn.endpoint, requiresPairing: self.pairedLANRequired) else {
+                conn.cancel()
+                Log.info("Rejected unpaired LAN stream; matching-code pairing is required")
+                return
+            }
             Log.info("new connection from \(String(describing: conn.endpoint))")
             // usbmux-forwarded (cable) connections arrive from loopback;
             // anything else came over the network.
@@ -960,6 +1043,8 @@ final class StreamReceiver: ObservableObject {
                 self.pendingConnections.append(conn)
                 conn.stateUpdateHandler = { [weak self] state in
                     guard let self, case .ready = state else { return }
+                    self.onVideoQueue {
+                    guard self.pendingConnections.contains(where: { $0 === conn }) else { conn.cancel(); return }
                     // This socket has not won the session yet. Keep cursor UDP
                     // out of its provisional hello: otherwise its flow could
                     // arrive before adopt(), then be indistinguishable from
@@ -968,6 +1053,7 @@ final class StreamReceiver: ObservableObject {
                     conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
                         [weak self] data, _, isComplete, error in
                         guard let self else { return }
+                        self.onVideoQueue {
                         // Only a still-tracked candidate may adopt: adoption
                         // of a rival and stop() both clear the list, so a
                         // late callback can't evict a session or resurrect a
@@ -985,9 +1071,11 @@ final class StreamReceiver: ObservableObject {
                             conn.cancel()
                         }
                         _ = isComplete
+                        }
+                    }
                     }
                 }
-                conn.start(queue: self.queue)
+                conn.start(queue: self.inputIOQueue)
             } else {
                 self.adopt(conn)
             }
@@ -1042,9 +1130,13 @@ final class StreamReceiver: ObservableObject {
     /// without the cursor port while it proved itself (see the listener), with
     /// the bytes it sent back in `initialData`. Once adopted, the full hello
     /// opens a cursor flow that unambiguously belongs to this session.
+    static func allowsPlainChannel(endpoint: NWEndpoint, requiresPairing: Bool) -> Bool {
+        !requiresPairing || DirectCable.isLoopback(endpoint)
+    }
+
     private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil,
                        authenticated: Bool = false) {
-        guard !pairedLANRequired || authenticated || DirectCable.isLoopback(conn.endpoint) else {
+        guard authenticated || Self.allowsPlainChannel(endpoint: conn.endpoint, requiresPairing: pairedLANRequired) else {
             conn.cancel()
             return
         }
@@ -1057,6 +1149,10 @@ final class StreamReceiver: ObservableObject {
         let adoptedTransport: StreamTransport? = transport == "USB" ? .usb : nil
         connection?.cancel()
         connection = conn
+        controlOutboxLock.lock()
+        for (id, entry) in controlOutboxes where id != ObjectIdentifier(conn) { entry.writer.invalidate() }
+        controlOutboxes = controlOutboxes.filter { $0.key == ObjectIdentifier(conn) }
+        controlOutboxLock.unlock()
         DispatchQueue.main.async { self.resetPhoneKeyboardSession(); self.resetPhoneArrangementSession() }
         // The race is decided: rival candidates die here.
         for pending in pendingConnections where pending !== conn { pending.cancel() }
@@ -1083,8 +1179,10 @@ final class StreamReceiver: ObservableObject {
             self.cursorSprite = nil
             self.onCursor?(0.5, 0.5, false)
         }
+        var readied = false   // video-queue only, including delayed .ready callbacks
         let onReady: () -> Void = { [weak self] in
-            guard let self else { return }
+            guard let self, !readied, self.connection === conn else { return }
+            readied = true
             self.lastDataReceived = Date()
             // Non-loopback is WiFi only if the path says so: a Mac receiver on
             // a Thunderbolt Bridge or USB-C peer link is a cable too.
@@ -1097,17 +1195,20 @@ final class StreamReceiver: ObservableObject {
             self.sendHello(on: conn)
         }
         conn.stateUpdateHandler = { [weak self] state in
-            guard let self, conn === self.connection else { return }   // replaced: stay quiet
-            switch state {
-            case .ready: onReady()
-            case .failed, .cancelled: self.setConnected(false)
-            default: break
+            guard let self else { return }
+            self.onVideoQueue {
+                guard conn === self.connection else { return }   // replaced: stay quiet
+                switch state {
+                case .ready: onReady()
+                case .failed, .cancelled: self.setConnected(false)
+                default: break
+                }
             }
         }
         if conn.state == .ready {
             onReady()   // already up: the handler will not fire again
         } else {
-            conn.start(queue: queue)
+            conn.start(queue: inputIOQueue)
         }
         if let initialData, !initialData.isEmpty {
             bytesThisWindow += initialData.count
@@ -1256,7 +1357,7 @@ final class StreamReceiver: ObservableObject {
             DispatchQueue.main.async {
                 guard self.keyboardDelivery.complete(sequence,focus:focus) else { return }
                 if !accepted {
-                    self.keyboardError = "Keyboard input paused because focus or access changed. Check the Mac field before reopening Keyboard."
+                    self.showKeyboardError("Keyboard input paused because focus or access changed. Check the Mac field before reopening Keyboard.")
                     self.keyboardPresentation.dismiss()
                 }
             }
@@ -1383,6 +1484,12 @@ final class StreamReceiver: ObservableObject {
     // MARK: - Control messages (phone -> Mac)
 
     private func sendHello(on conn: NWConnection, includeCursorPort: Bool = true) {
+        let inputs = inputsSnapshot
+        let devicePixelsWide = inputs.pixelsWide, devicePixelsHigh = inputs.pixelsHigh
+        let deviceScale = inputs.scale, displayMaxFrameRate = inputs.displayMaxFrameRate
+        let panelOverride = inputs.panel, maxEncodeWide = inputs.maxEncodeWide
+        let maxEncodeHigh = inputs.maxEncodeHigh, maxPixelsPerSecond = inputs.maxPixelsPerSecond
+        let hevcCapability = inputs.hevc
         var hello: [String: Any] = [
             "type": "hello",
             "pixelsWide": devicePixelsWide,
@@ -1421,7 +1528,7 @@ final class StreamReceiver: ObservableObject {
         hello["videoCaps"] = videoCaps
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.
-        let announcesCursorPort = includeCursorPort && cursorListenerReady
+        let announcesCursorPort = includeCursorPort && cursorListenerReady && conn !== pairedConnection
         if announcesCursorPort { hello["cursorPort"] = Int(cursorPort) }
         // Additive: decode ceiling (PROTOCOL.md 6.5) — ask for the full
         // desktop but a stream no larger than this machine can decode.
@@ -1553,14 +1660,14 @@ final class StreamReceiver: ObservableObject {
         let unconfirmed = keyboardDelivery.count > 0
         macSupportsKeyboard = false
         keyboardPresentation.disconnect(); keyboardSequence = 0; keyboardInteraction = 0; keyboardDelivery.reset()
-        if unconfirmed { keyboardError = "Connection changed before keyboard delivery was confirmed. Check the Mac field before retrying." }
+        if unconfirmed { showKeyboardError("Connection changed before keyboard delivery was confirmed. Check the Mac field before retrying.") }
     }
     private func recordKeyboardInteraction() -> Int {
         if keyboardInteraction < Int.max-1 { keyboardInteraction += 1 }
         keyboardPresentation.recordInteraction(keyboardInteraction)
         return keyboardInteraction
     }
-    func showPhoneKeyboard() { keyboardError = nil; keyboardPresentation.openManually() }
+    func showPhoneKeyboard() { showKeyboardError(nil); keyboardPresentation.openManually() }
     var resignPhoneKeyboard: (() -> Void)?
     func hidePhoneKeyboard() { resignPhoneKeyboard?(); keyboardPresentation.dismiss() }
     func sendKeyboard(_ action: KeyboardCommand.Action, text: String? = nil) {
@@ -1569,14 +1676,14 @@ final class StreamReceiver: ObservableObject {
         let command = KeyboardCommand(sequence:keyboardSequence,focus:focus.token,action:action,text:text,manual:keyboardPresentation.manual)
         guard let data = try? JSONEncoder().encode(command), var object = try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return }
         guard let conn = connection, keyboardDelivery.register(keyboardSequence,focus:focus.token) else {
-            keyboardError = "Keyboard delivery is delayed. Check the Mac field before retrying."; keyboardPresentation.dismiss(); return
+            showKeyboardError("Keyboard delivery is delayed. Check the Mac field before retrying."); keyboardPresentation.dismiss(); return
         }
         let sequence = keyboardSequence, token = focus.token
         if action == .enter { object["keyboardIntent"] = recordKeyboardInteraction() }
         object["type"] = "keyboardInput"; sendControl(object,on:conn)
         DispatchQueue.main.asyncAfter(deadline:.now()+3) { [weak self,weak conn] in
             guard let self, let conn, self.connection === conn, self.keyboardDelivery.complete(sequence,focus:token) else { return }
-            self.keyboardError = "Keyboard delivery was not confirmed. Check the Mac field before retrying; text was not resent."
+            self.showKeyboardError("Keyboard delivery was not confirmed. Check the Mac field before retrying; text was not resent.")
             self.keyboardPresentation.dismiss()
         }
     }
@@ -1657,19 +1764,28 @@ final class StreamReceiver: ObservableObject {
     @discardableResult
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
                              completion: (() -> Void)? = nil) -> Bool {
-        guard let conn = conn ?? connection,
-              let payload = try? JSONSerialization.data(withJSONObject: message) else {
-            completion?()
-            return false
+        guard let conn = conn ?? connection else { completion?(); return false }
+        controlOutboxLock.lock()
+        let id = ObjectIdentifier(conn)
+        let outbox: InputControlOutbox
+        if let existing = controlOutboxes[id] { outbox = existing.writer }
+        else {
+            // Pending candidates are bounded elsewhere; retire closed sockets
+            // without retaining their buffered input into a new session.
+            if controlOutboxes.count >= 8 {
+                controlOutboxes.values.forEach { $0.writer.invalidate() }; controlOutboxes.removeAll()
+            }
+            outbox = InputControlOutbox(write: { [weak conn] frame, finished in
+                guard let conn else { finished(false); return }
+                conn.send(content: frame, completion: .contentProcessed { finished($0 == nil) })
+            }, failure: { [weak conn] in
+                Log.info("Input send failed or stalled; retiring the connection rather than replaying buffered input")
+                conn?.cancel()
+            })
+            controlOutboxes[id] = (conn, outbox)
         }
-        var header = UInt32(payload.count).bigEndian
-        var frame = Data(bytes: &header, count: 4)
-        frame.append(payload)
-        conn.send(content: frame, completion: .contentProcessed { error in
-            if let error { Log.info("control send error: \(error)") }
-            completion?()
-        })
-        return true
+        controlOutboxLock.unlock()
+        return outbox.enqueue(message, completion: completion)
     }
 
     // MARK: - Socket read + length-prefixed deframing
@@ -1677,9 +1793,11 @@ final class StreamReceiver: ObservableObject {
     private func receive(on conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
             [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            self.onVideoQueue {
             // A replaced connection's last callback must not touch the
             // session (its EOF used to flip `connected` off for the new one).
-            guard let self, conn === self.connection else { return }
+            guard conn === self.connection else { return }
             if let data, !data.isEmpty {
                 self.lastDataReceived = Date()
                 self.bytesThisWindow += data.count
@@ -1695,16 +1813,29 @@ final class StreamReceiver: ObservableObject {
                 self.setConnected(false)
                 return
             }
+            // One receive remains outstanding: do not prefetch unbounded
+            // video or let stale callbacks mutate a replacement session.
             self.receive(on: conn)
+            }
         }
     }
 
+    /// Far above any keyframe the sender produces (and the 24 KB sprite cap).
+    static let maxFrameBytes = 32 << 20
     private func drainFrames() {
         // Cursor-based drain so we only compact the buffer once per batch.
         var cursor = buffer.startIndex
         while buffer.distance(from: cursor, to: buffer.endIndex) >= 4 {
             let len = buffer[cursor..<buffer.index(cursor, offsetBy: 4)]
                 .withUnsafeBytes { Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self))) }
+            guard len <= Self.maxFrameBytes else {
+                // Anything on the LAN can reach port 9000 before pairing gates
+                // it; never buffer toward a multi-gigabyte announced frame.
+                Log.info("frame of \(len) bytes exceeds \(Self.maxFrameBytes) — dropping the connection")
+                buffer.removeAll()
+                if let conn = connection { conn.cancel(); connection = nil; setConnected(false) }
+                return
+            }
             guard buffer.distance(from: cursor, to: buffer.endIndex) >= 4 + len else { break }
             let start = buffer.index(cursor, offsetBy: 4)
             let end = buffer.index(start, offsetBy: len)
@@ -2044,6 +2175,10 @@ final class StreamReceiver: ObservableObject {
             statsReportCounter += 1
             if statsReportCounter >= 5 {
                 statsReportCounter = 0
+                controlOutboxLock.lock()
+                let writers = controlOutboxes.values.map { $0.writer }
+                controlOutboxLock.unlock()
+                let inputQueues = writers.map { $0.metricsSnapshot(reset:true) }
                 sendControl([
                     "type": "stats",
                     "transport": transport,
@@ -2057,6 +2192,16 @@ final class StreamReceiver: ObservableObject {
                     "cur": stats.cursorPerSec,
                     "curLost": stats.cursorLost,
                     "inp50": macInputP50.rounded(),
+                    "inp95": macInputP95.rounded(),
+                    "inputQueuePeak": inputQueues.map(\.peakPending).max() ?? 0,
+                    "inputQueueNow": inputQueues.map(\.pendingNow).reduce(0,+),
+                    "inputQueueP95Ms": (inputQueues.map(\.waitP95Ms).max() ?? 0).rounded(),
+                    "inputEnqueued": inputQueues.map(\.enqueued).reduce(0,+),
+                    "inputWrites": inputQueues.map(\.writes).reduce(0,+),
+                    "inputMaxStep": (inputQueues.map(\.maxMoveStep).max() ?? 0).rounded(),
+                    "inputMerged": inputQueues.map(\.merged).reduce(0,+),
+                    "inputStaleDropped": inputQueues.map(\.staleDropped).reduce(0,+),
+                    "inputOverflowDropped": inputQueues.map(\.overflowDropped).reduce(0,+),
                     "capFps": macCapFps,
                     "dec50": stats.decodeP50.rounded(),
                     "ph50": stats.photonP50.rounded(),

@@ -24,6 +24,7 @@ final class PhoneArrangementPreviewTests:XCTestCase {
         let bitmap = try XCTUnwrap(renderer.nsImage?.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)))
         let png = try XCTUnwrap(bitmap.representation(using:.png,properties:[:]))
         let path = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("build/phone-arrangement-20261111/four-placements.png")
+        try FileManager.default.createDirectory(at:path.deletingLastPathComponent(),withIntermediateDirectories:true)
         try png.write(to:path)
     }
 }

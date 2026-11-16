@@ -30,7 +30,9 @@ final class InputInjector {
     private var isDown = false
     private var relativeDown = false
     private var scrollRemainder = CGPoint.zero
+    private var directScrollRemainder = CGPoint.zero
     private var pointerRemainder = CGPoint.zero
+    private let displayPixelsWide: (CGDirectDisplayID) -> Int
     private var relativeLedger = RelativePointerLedger()
     private(set) var lastPostedPoint:CGPoint?
     private let inputLock = NSRecursiveLock()
@@ -73,8 +75,10 @@ final class InputInjector {
          boundsProvider: @escaping (CGDirectDisplayID) -> CGRect = { CGDisplayBounds($0) },
          cursorProvider: @escaping () -> CGPoint = { CGEvent(source: nil)?.location ?? .zero },
          displaysProvider: @escaping () -> [CGRect] = InputInjector.activeDisplayBounds,
-         post: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) }) {
+         post: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
+         pixelsWideProvider: @escaping (CGDirectDisplayID) -> Int = { CGDisplayPixelsWide($0) }) {
         self.displayID = displayID; self.displayBounds = boundsProvider; self.cursorProvider = cursorProvider
+        self.displayPixelsWide = pixelsWideProvider
         self.displaysProvider = displaysProvider; self.postEvent = post
     }
 
@@ -103,7 +107,8 @@ final class InputInjector {
             if abs(pointerRemainder.y) < 1e-9 { pointerRemainder.y = 0 }
             guard x != 0 || y != 0,
                   let point = PointerMapping.relative(from:current,dx:x,dy:y,displays:displaysProvider()) else { return }
-            postMouse(relativeDown ? .leftMouseDragged : .mouseMoved, point: point)
+            postMouse(relativeDown ? .leftMouseDragged : .mouseMoved, point: point,
+                      movement:CGPoint(x:point.x-current.x,y:point.y-current.y))
             relativeLedger.posted(point,now:now)
         case "dragBegan":
             guard !relativeDown else { return }
@@ -168,17 +173,29 @@ final class InputInjector {
         }
         return success
     }
-    private func postMouse(_ type: CGEventType, point: CGPoint, clicks: Int = 1, right: Bool = false) {
+    private func postMouse(_ type: CGEventType, point: CGPoint, clicks: Int = 1, right: Bool = false,
+                           movement:CGPoint? = nil) {
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point,
                                   mouseButton: right ? .right : .left) else { return }
         lastPostedPoint = point
+        if let movement {
+            // Public Quartz relative fields must agree with the mapped global
+            // position, including display-edge clipping. Window tracking can
+            // consume deltas instead of only the absolute cursor location.
+            event.setIntegerValueField(.mouseEventDeltaX,value:Int64(exactly:movement.x.rounded()) ?? 0)
+            event.setIntegerValueField(.mouseEventDeltaY,value:Int64(exactly:movement.y.rounded()) ?? 0)
+        }
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clicks)); postEvent(event)
+    }
+    func pointerReadbackMetrics() -> RelativePointerLedger.Metrics {
+        inputLock.lock();defer { inputLock.unlock() }
+        return relativeLedger.metricsSnapshot(reset:true)
     }
     /// Posts releases only for inputs this injector pressed; idle cleanup posts nothing.
     func releaseAll() {
         inputLock.lock(); defer { inputLock.unlock() }
         let releasePoint = relativeLedger.base(observation:cursorProvider(),now:ProcessInfo.processInfo.systemUptime)
-        scrollRemainder = .zero; pointerRemainder = .zero
+        scrollRemainder = .zero; directScrollRemainder = .zero; pointerRemainder = .zero
         relativeLedger.reset()
         if isDown || relativeDown { postMouse(.leftMouseUp, point: releasePoint, clicks: 0) }
         isDown = false; relativeDown = false
@@ -255,11 +272,22 @@ final class InputInjector {
     func handleScroll(dx: Double, dy: Double) {
         inputLock.lock(); defer { inputLock.unlock() }
         let bounds = displayBounds(displayID)
-        let scale = bounds.width > 0 ? Double(CGDisplayPixelsWide(displayID)) / bounds.width : 2
-        guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
+        let pixels = bounds.width > 0 ? Double(displayPixelsWide(displayID)) : 0
+        let scale = bounds.width > 0 && pixels > 0 ? pixels / bounds.width : 2
+        guard dx.isFinite, dy.isFinite, scale.isFinite, scale > 0 else { return }
+        // Keep the sub-point remainder: a slow two-finger scroll is many
+        // fractional deltas, and rounding each one alone posts nothing.
+        directScrollRemainder.x += dx / scale; directScrollRemainder.y += dy / scale
+        func step(_ value: CGFloat) -> CGFloat { (value + (value >= 0 ? 1e-9 : -1e-9)).rounded(.towardZero) }
+        let x = step(directScrollRemainder.x), y = step(directScrollRemainder.y)
+        directScrollRemainder.x -= x; directScrollRemainder.y -= y
+        if abs(directScrollRemainder.x) < 1e-9 { directScrollRemainder.x = 0 }
+        if abs(directScrollRemainder.y) < 1e-9 { directScrollRemainder.y = 0 }
+        guard x != 0 || y != 0, abs(x) < Double(Int32.max), abs(y) < Double(Int32.max),
+              let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
                                   wheelCount: 2,
-                                  wheel1: Int32((dy / scale).rounded()),
-                                  wheel2: Int32((dx / scale).rounded()),
+                                  wheel1: Int32(y),
+                                  wheel2: Int32(x),
                                   wheel3: 0) else { return }
         postEvent(event)
     }

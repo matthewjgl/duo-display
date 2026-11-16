@@ -127,6 +127,20 @@ struct KeyboardClickEvidence {
     }
 }
 
+/// A transient message that clears itself. Each new message gets a fresh token,
+/// so an older expiry can never hide a newer message.
+struct ExpiringNotice: Equatable {
+    static let lifetime: TimeInterval = 6
+    private(set) var text: String?
+    private(set) var token = 0
+    /// Returns the token to expire later, or nil when the notice was cleared.
+    mutating func show(_ message: String?) -> Int? {
+        token &+= 1; text = message
+        return message == nil ? nil : token
+    }
+    mutating func expire(_ expected: Int) { if expected == token { text = nil } }
+}
+
 /// Delivery metadata only: never retains text. No automatic resend can duplicate
 /// text after an uncertain network failure; the user gets an explicit warning.
 struct KeyboardDeliveryLedger {

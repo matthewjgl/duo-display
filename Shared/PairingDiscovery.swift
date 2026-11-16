@@ -33,9 +33,12 @@ final class PairingDiscovery: ObservableObject {
     private let hintDelay: TimeInterval
     private let pairingWindow: TimeInterval
 
-    init(hintDelay: TimeInterval = 8, pairingWindow: TimeInterval = 60) {
+    private let watchesPath: Bool
+    /// `watchesPath: false` is for tests that must not depend on the host network.
+    init(hintDelay: TimeInterval = 8, pairingWindow: TimeInterval = 60, watchesPath: Bool = true) {
         self.hintDelay = max(0.01, hintDelay)
         self.pairingWindow = max(0.01, min(60, pairingWindow))
+        self.watchesPath = watchesPath
     }
 
     var diagnostics: String {
@@ -48,7 +51,7 @@ final class PairingDiscovery: ObservableObject {
     func browse() {
         guard exchange == nil else { return }
         browser?.cancel(); emptyHint?.cancel(); macs = []
-        let browse = BonjourBrowser(type: Self.service, txt: false)
+        let browse = BonjourBrowser(type: Self.service, txt: false, watchesPath: watchesPath)
         browser = browse
         browserState = "Starting"
         status = DiscoveryGuidance.searching
@@ -92,13 +95,15 @@ final class PairingDiscovery: ObservableObject {
     func advertise(name: String, persistent: Bool = false) {
         stop()
         self.persistent = persistent; advertisedName = name
-        let monitor = NWPathMonitor(); path = monitor
-        var initial = true
-        monitor.pathUpdateHandler = { [weak self] _ in
-            if initial { initial = false; return }
-            Task { @MainActor in self?.recover() }
+        if watchesPath {
+            let monitor = NWPathMonitor(); path = monitor
+            let filter = PathChangeFilter()
+            monitor.pathUpdateHandler = { [weak self] update in
+                guard filter.changed(update) else { return }
+                Task { @MainActor in self?.recover() }
+            }
+            monitor.start(queue: DispatchQueue(label: "DuoDisplay.pairing-path"))
         }
-        monitor.start(queue: DispatchQueue(label: "DuoDisplay.pairing-path"))
         openListener(name: name)
     }
 
@@ -235,8 +240,8 @@ final class PairingDiscovery: ObservableObject {
             if self?.persistent == true { self?.recover() }
             action?(peer)
         }
-        exchange.onFailure = { [weak self] _ in
-            self?.status = "Pairing interrupted or declined. Try Pair & Connect again."
+        exchange.onFailure = { [weak self] error in
+            self?.status = error.localizedDescription
             self?.lastFailure = self?.status
             self?.exchange = nil; self?.pairedAction = nil; self?.isPairing = false
             if self?.persistent == true { self?.recover() }

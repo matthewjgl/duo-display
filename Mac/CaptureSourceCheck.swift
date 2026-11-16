@@ -12,6 +12,18 @@ import Foundation
 /// apart); only a mismatch that outlasts `tolerance` counts.
 struct CaptureSourceCheck {
     static let tolerance: TimeInterval = 1.5
+    // SCK converts pixel/scale coordinates back to logical desktop points.
+    // Numerically identical edges can differ by a few floating-point ULPs
+    // (observed938 versus937.9999999999999). That must never tear down capture.
+    // One millionth of a point admits rounding noise, not a different pixel,
+    // display arrangement or resolution. Keep sustained real mismatch recovery.
+    static let rectPrecisionTolerance: CGFloat = 0.000_001
+    static func sameDisplayRect(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        zip([lhs.minX, lhs.minY, lhs.width, lhs.height],
+            [rhs.minX, rhs.minY, rhs.width, rhs.height]).allSatisfy {
+            $0.isFinite && $1.isFinite && abs($0 - $1) <= rectPrecisionTolerance
+        }
+    }
 
     private var mismatchSince: Date?
 
@@ -19,7 +31,7 @@ struct CaptureSourceCheck {
     /// delivering some other rect for longer than `tolerance`; the caller
     /// then re-attaches capture and should start a fresh check.
     mutating func frame(screenRect: CGRect, expected: CGRect, now: Date = Date()) -> Bool {
-        guard !screenRect.isEmpty, !expected.isEmpty, screenRect != expected else {
+        guard !screenRect.isEmpty, !expected.isEmpty, !Self.sameDisplayRect(screenRect, expected) else {
             mismatchSince = nil
             return false
         }

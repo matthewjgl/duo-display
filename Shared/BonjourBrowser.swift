@@ -2,6 +2,42 @@ import Foundation
 import Network
 import dnssd
 
+/// The parts of a network path that can change what discovery sees. NWPathMonitor
+/// re-delivers updates with identical interfaces (observed repeatedly on Wi-Fi);
+/// restarting discovery for those cleared device lists and, for the pairing
+/// advertiser, withdrew the Mac's service behind an escalating backoff.
+struct PathSignature: Equatable {
+    var satisfied: Bool
+    var interfaces: [String]
+    var gateways: [String]
+    var ipv4: Bool
+    var ipv6: Bool
+    init(satisfied: Bool, interfaces: [String], gateways: [String] = [], ipv4: Bool = true, ipv6: Bool = true) {
+        self.satisfied = satisfied; self.interfaces = interfaces.sorted(); self.gateways = gateways.sorted()
+        self.ipv4 = ipv4; self.ipv6 = ipv6
+    }
+    init(_ path: NWPath) {
+        self.init(satisfied: path.status == .satisfied,
+                  interfaces: path.availableInterfaces.map { "\($0.name):\($0.type)" },
+                  gateways: path.gateways.map { String(describing: $0) },
+                  ipv4: path.supportsIPv4, ipv6: path.supportsIPv6)
+    }
+}
+
+/// Thread-safe: monitors call back on their own queues. The first update is the
+/// baseline (the old `initial` skip); later ones report only a material change.
+final class PathChangeFilter {
+    private let lock = NSLock()
+    private var last: PathSignature?
+    func changed(_ path: NWPath) -> Bool { changed(PathSignature(path)) }
+    func changed(_ signature: PathSignature) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        defer { last = signature }
+        guard let last else { return false }
+        return last != signature
+    }
+}
+
 /// One browser per role. Failed browsers are terminal; replace them with bounded
 /// backoff. Path changes and foreground retries retire old callbacks first.
 @MainActor
@@ -25,19 +61,22 @@ final class BonjourBrowser {
     var onResults: (([NWBrowser.Result]) -> Void)?
     var onState: ((NWBrowser.State) -> Void)?
 
+    private let watchesPath: Bool
+    /// `watchesPath: false` is for tests that must not depend on the host network.
     init(type: String, txt: Bool = true, retryDelay: TimeInterval = 2,
-         startupTimeout: TimeInterval = 10,
+         startupTimeout: TimeInterval = 10, watchesPath: Bool = true,
          launch: @escaping (NWBrowser) -> Void = { $0.start(queue: .main) }) {
         self.type = type; self.txt = txt; self.retryDelay = retryDelay
         self.startupTimeout = max(0.01, startupTimeout); self.launch = launch
+        self.watchesPath = watchesPath
     }
     func start() {
         active = true
-        if path == nil {
+        if path == nil, watchesPath {
             let monitor = NWPathMonitor(); path = monitor
-            var initial = true
-            monitor.pathUpdateHandler = { [weak self] _ in
-                if initial { initial = false; return }
+            let filter = PathChangeFilter()
+            monitor.pathUpdateHandler = { [weak self] update in
+                guard filter.changed(update) else { return }
                 Task { @MainActor in self?.recover() }
             }
             monitor.start(queue: DispatchQueue(label: "DuoDisplay.discovery-path"))

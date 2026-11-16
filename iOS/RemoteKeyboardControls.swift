@@ -9,7 +9,11 @@ struct RemoteKeyboardControls: View {
                 // No persistent keyboard pill. Dismiss overlays the video only
                 // during editing, reserving no accessory strip above the keys.
                 if let error = receiver.keyboardError {
-                    Text(error).font(.caption).padding(8).background(.regularMaterial,in:RoundedRectangle(cornerRadius:8))
+                    Button { receiver.showKeyboardError(nil) } label: {
+                        Text(error).font(.caption).multilineTextAlignment(.leading)
+                            .fixedSize(horizontal:false,vertical:true)
+                            .padding(8).background(.regularMaterial,in:RoundedRectangle(cornerRadius:8))
+                    }.buttonStyle(.plain).accessibilityHint("Dismiss")
                 }
                 Spacer()
             }.frame(maxWidth:280,alignment:.leading)

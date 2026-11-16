@@ -12,13 +12,14 @@ struct PhoneWorkspaceHeader:View {
     let title:String
     let detail:String
     let compact:Bool
+    var deviceKind = "iPhone"
     var body:some View {
         VStack(alignment:.leading,spacing:compact ? 10 : 14) {
             Image(systemName:"display.2").font(compact ? .title2 : .largeTitle).foregroundStyle(.tint).accessibilityHidden(true)
             Text(title).font(compact ? .title2.bold() : .largeTitle.bold()).fixedSize(horizontal:false,vertical:true).accessibilityAddTraits(.isHeader)
             Text(detail).font(.body).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
-            Label(name,systemImage:"iphone").font(.subheadline).foregroundStyle(.secondary)
-                .fixedSize(horizontal:false,vertical:true).accessibilityLabel("This iPhone: "+name)
+            Label(name,systemImage:deviceKind == "iPad" ? "ipad" : "iphone").font(.subheadline).foregroundStyle(.secondary)
+                .fixedSize(horizontal:false,vertical:true).accessibilityLabel("This \(deviceKind): "+name)
         }.frame(maxWidth:.infinity,alignment:.leading)
     }
 }
@@ -61,6 +62,7 @@ struct PhoneMacChoiceRow:View {
 }
 struct PhonePairingContent:View {
     let name:String,code:String,approved:Bool
+    var deviceKind = "iPhone"
     var approve:()->Void
     var cancel:()->Void
     @Environment(\.dynamicTypeSize) private var textSize
@@ -78,7 +80,7 @@ struct PhonePairingContent:View {
             Text(approved ? "Waiting for approval on your Mac." : "Make sure this code matches your Mac, then approve on both devices.")
                 .font(.body).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             Button(action:approve) {
-                Label(approved ? "Approved on this iPhone" : "Codes match — approve",systemImage:approved ? "checkmark.circle.fill" : "checkmark.shield")
+                Label(approved ? "Approved on this \(deviceKind)" : "Codes match — approve",systemImage:approved ? "checkmark.circle.fill" : "checkmark.shield")
                     .frame(maxWidth:.infinity,minHeight:44)
             }.buttonStyle(.borderedProminent).disabled(approved)
             Button(role:.cancel,action:cancel) {
@@ -102,6 +104,9 @@ struct PhonePairingContent:View {
 enum PhoneErrorCopy {
     static func summary(_ detail:String) -> String {
         let value = detail.lowercased()
+        if value.contains("update sideextend on both devices") { return "Update SideExtend on both devices to pair securely." }
+        if value.contains("already paired") { return "Already paired. Use Connect, or forget the pairing on both devices to pair again." }
+        if value.contains("pairing verification failed") { return "Codes couldn’t be verified. Cancel on both devices and try again." }
         if value.contains("policy denied") || value.contains("policydenied") || value.contains("local network access denied") { return "Local discovery is blocked. Check Local Network access in Settings." }
         if value.contains("rejected") || value.contains("not approved") { return "Pairing wasn’t approved. You can try again." }
         if value.contains("timed out") || value.contains("timeout") || value.contains("expired") { return "Your Mac didn’t respond. Keep it awake and try again." }

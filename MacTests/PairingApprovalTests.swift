@@ -39,3 +39,13 @@ final class PairingApprovalTests: XCTestCase {
         XCTAssertNil(c.prompt); XCTAssertEqual(saved, 0)
     }
 }
+
+extension PairingApprovalTests {
+    func testExistingTrustedIdentityCannotSilentlyReplaceItsKey() throws {
+        var saves = 0
+        let coordinator = PairingApprovalCoordinator(ownID: "self", alreadyTrusted: { $0 == "trusted" }, save: { _, _ in saves += 1 })
+        XCTAssertThrowsError(try coordinator.begin(peerID: "trusted", name: "Spoofed phone",
+            material: .init(key: SymmetricKey(size: .bits256), verificationCode: "123456")))
+        XCTAssertNil(coordinator.prompt); XCTAssertEqual(saves, 0)
+    }
+}

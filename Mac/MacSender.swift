@@ -384,6 +384,23 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Input latency: touches arrive stamped in our clock (the phone applies
     // its sync offset); delta to now = network + deframe + dispatch.
     private var inputLatencies: [Double] = []
+    // Per-window aggregate performance only; never retain touch locations/text.
+    private var trackpadMovesReceived = 0, trackpadMovesStale = 0
+    private var trackpadLastMoveAt: Double?
+    private var trackpadArrivalGaps: [Double] = [], trackpadHandlerTimes: [Double] = []
+    private func trackpadTimingSummary() -> String {
+        func p95(_ samples: [Double]) -> Double {
+            let values = samples.sorted()
+            return values.isEmpty ? 0 : values[min(values.count-1,Int(Double(values.count)*0.95))]
+        }
+        let readback = inputInjector?.pointerReadbackMetrics() ?? RelativePointerLedger.Metrics()
+        let result = String(format:"trackpad moves=%d stale=%d arrival95=%.1fms handler95=%.1fms readbackAmbiguous=%d readbackUnmatched=%d readbackExpired=%d",
+            trackpadMovesReceived,trackpadMovesStale,p95(trackpadArrivalGaps),p95(trackpadHandlerTimes),
+            readback.ambiguousReadbacks,readback.unmatchedReadbacks,readback.expiredTargets)
+        trackpadMovesReceived = 0;trackpadMovesStale = 0
+        trackpadArrivalGaps.removeAll(keepingCapacity:true);trackpadHandlerTimes.removeAll(keepingCapacity:true)
+        return result
+    }
     // These policies bound noisy paths while retaining an explicit record when
     // details were suppressed. Unknown types and unparseable messages live on
     // `queue` with the rest of the control-connection state; encoder failures
@@ -1563,6 +1580,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             guard let self, !self.stopped,
                   DeviceIdentity.matches(self.peerIdentity.pinnedID, expectedPeerID) else { return }
+            if case .tcp = newTransport, self.requiredPairedPeer == nil,
+               let kind = self.lastHello?.device, kind != "Mac" {
+                self.reportGone("Pair this phone with this Mac before switching to Wi-Fi. Open Find Macs on the phone, compare the codes and approve on both devices.")
+                return
+            }
             self.switchingTransport = true
             let label = if case .tcp = newTransport { "WiFi" } else { "USB" }
             Log.info("switching \(self.endpointName) to \(label)")
@@ -1864,6 +1886,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Bookkeeping shared by both transports once a connection is live.
     private func becomeReady(_ conn: NWConnection) {
         Log.info("connection ready to \(endpointName)")
+        trackpadLastMoveAt = nil
+        trackpadMovesReceived = 0;trackpadMovesStale = 0
+        trackpadArrivalGaps.removeAll(keepingCapacity:true);trackpadHandlerTimes.removeAll(keepingCapacity:true)
+        inputLatencies.removeAll(keepingCapacity:true)
         connectionGeneration &+= 1
         let readyGeneration = connectionGeneration
         // Per-session; the receiver rewound its floor with the connection.
@@ -2379,7 +2405,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps)}")
+                // Report this interval, not an old rolling tail that remains
+                // high long after the user has stopped moving. Additive fields
+                // let newer diagnostics distinguish no samples from low age.
+                self.inputLatencies.removeAll(keepingCapacity:true)
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"inpMax\":\(sorted.last?.rounded() ?? 0),\"inpSamples\":\(sorted.count),\"capFps\":\(capFps)}")
             }
             self.schedulePing()
         }
@@ -2664,29 +2694,31 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Control messages (phone -> Mac)
 
     private func receiveControl(on conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
-            guard let self, self.connection === conn, error == nil, let data, data.count == 4 else {
-                if let error {
-                    Log.info("control receive ended: \(error)")
-                    // A receive error on the live connection is fatal to it.
-                    // Route through linkDied so a cable session ends instead
-                    // of silently waiting for the watchdog to redial. Skip
-                    // ECANCELED: that is our own cancel (stop, migrate,
-                    // redial), not the link dying.
-                    var isOwnCancel = false
-                    if case .posix(let code) = error, code == .ECANCELED { isOwnCancel = true }
-                    if let self, self.connection === conn, !isOwnCancel {
-                        self.linkDied("receive failed: \(error)")
+        receiveControl(on: conn, frames: InputControlFrames())
+    }
+
+    private func receiveControl(on conn: NWConnection, frames: InputControlFrames) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, complete, error in
+            guard let self, self.connection === conn else { return }
+            var frames = frames
+            if let data, !data.isEmpty {
+                do {
+                    for payload in try frames.append(data) {
+                        guard self.connection === conn, !self.stopped else { return }
+                        self.handleControl(payload) // Existing peer/session admission remains authoritative.
                     }
+                } catch {
+                    self.linkDied("Invalid input frame; reconnect to continue.")
+                    return
                 }
-                return
             }
-            let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
-            guard len > 0, len < 1 << 20 else { return }
-            conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
-                guard let self, self.connection === conn, error == nil, let payload, payload.count == len else { return }
-                self.handleControl(payload)
-                self.receiveControl(on: conn)
+            if let error {
+                if case .posix(let code) = error, code == .ECANCELED { return }
+                self.linkDied("receive failed: \(error)")
+            } else if complete {
+                self.linkDied("Input connection closed")
+            } else {
+                self.receiveControl(on: conn, frames: frames)
             }
         }
     }
@@ -2724,7 +2756,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // so one file holds both ends of the story.
             if let json = try? JSONSerialization.data(withJSONObject: obj),
                let line = String(data: json, encoding: .utf8) {
-                Log.info("PHONE-STATS \(line) | mac enc↓=\(dropsEncThisWindow) net↓=\(dropsNetThisWindow) pending=\(pendingSends)")
+                Log.info("PHONE-STATS \(line) | mac enc↓=\(dropsEncThisWindow) net↓=\(dropsNetThisWindow) pending=\(pendingSends) | \(trackpadTimingSummary())")
                 dropsEncThisWindow = 0
                 dropsNetThisWindow = 0
             }
@@ -2853,15 +2885,28 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         case "trackpad":
             guard permitsRelativeInput, let action = obj["action"] as? String else { return }
             let handlingStart = ProcessInfo.processInfo.systemUptime
+            if action == "move" {
+                trackpadMovesReceived += 1
+                if let previous = trackpadLastMoveAt {
+                    trackpadArrivalGaps.append((handlingStart-previous)*1000)
+                    if trackpadArrivalGaps.count > 128 { trackpadArrivalGaps.removeFirst() }
+                }
+                trackpadLastMoveAt = handlingStart
+            }
             // A stalled socket/video queue must not play old pointer movement
             // after recovery. Click/down/up/reset ordering is never discarded.
             if TrackpadPacketFreshness.skip(action:action,sentMacMs:obj["t"] as? Double,nowMacMs:Date().timeIntervalSince1970*1000) {
+                trackpadMovesStale += 1
                 if let probe = obj["probe"] as? Int { sendKeyboardObject(["type":"trackpadTiming","probe":probe,"stale":true]) }
                 return
             }
             if ["move","scroll","dragBegan"].contains(action) { suppressKeyboardInteraction() }
             inputInjector?.handleTrackpad(action: action, dx: obj["dx"] as? Double ?? 0,
                                          dy: obj["dy"] as? Double ?? 0, count: obj["count"] as? Int ?? 1)
+            if action == "move" {
+                trackpadHandlerTimes.append((ProcessInfo.processInfo.systemUptime-handlingStart)*1000)
+                if trackpadHandlerTimes.count > 128 { trackpadHandlerTimes.removeFirst() }
+            }
             if action == "click" { noteKeyboardInteraction(obj["keyboardIntent"] as? Int) }
             if let timestamp = obj["t"] as? Double {
                 let age = Date().timeIntervalSince1970*1000-timestamp
@@ -2869,6 +2914,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             if let probe = obj["probe"] as? Int { sendKeyboardObject(["type":"trackpadTiming","probe":probe,"handlingMs":(ProcessInfo.processInfo.systemUptime-handlingStart)*1000]) }
         case "touch":
+            guard permitsRelativeInput else { return }
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
                let y = obj["y"] as? Double {
@@ -2891,10 +2937,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         case "scroll":
+            guard permitsRelativeInput else { return }
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
                 inputInjector?.handleScroll(dx: dx, dy: dy)
             }
         case "pencil":
+            guard permitsRelativeInput else { return }
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
                let y = obj["y"] as? Double {
@@ -2913,6 +2961,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         case "proximity":
+            guard permitsRelativeInput else { return }
             if let entering = obj["entering"] as? Bool,
                let x = obj["x"] as? Double,
                let y = obj["y"] as? Double {

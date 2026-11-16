@@ -434,7 +434,7 @@ struct IdleView: View {
     private func welcome(compact:Bool) -> some View {
         PhoneWorkspaceHeader(name:PhoneName.current(appName:deviceName).name,
             title:receiver.connected ? "Starting your display" : "Choose your Mac",
-            detail:receiver.connected ? "Keep SideExtend open while your Mac gets ready." : "Open SideExtend on your Mac. Use the same Wi-Fi or a USB cable.",compact:compact)
+            detail:receiver.connected ? "Keep SideExtend open while your Mac gets ready." : "Open SideExtend on your Mac. Use the same Wi-Fi or a USB cable.",compact:compact,deviceKind:deviceKind)
     }
     private var pairing:some View {
         VStack(alignment:.leading,spacing:16) {
@@ -477,7 +477,7 @@ struct IdleView: View {
             DisclosureGroup("Connection help") {
                 VStack(alignment:.leading,spacing:12) {
                     Text("Wi-Fi: keep both apps open on the same local network. Approve matching codes once on both devices for a new pair.")
-                    Text("USB: connect your iPhone with a data cable.")
+                    Text("USB: connect your \(deviceKind) with a data cable.")
                     if let guidance = receiver.networkGuidance { Text(guidance.action) }
                 }.font(.subheadline).padding(.top,8)
             }.frame(minHeight:44)
@@ -732,11 +732,11 @@ struct SettingsView: View {
                 if receiver.connected { Text(receiver.link.phase.fullLabel).font(.subheadline).foregroundStyle(.secondary) }
             }.accessibilityElement(children:.combine).accessibilityLabel(receiver.link.phase.accessibilityLabel)
             HStack {
-                Text("This iPhone")
+                Text("This \(deviceKind)")
                 DeviceNameField(focus:$editingDeviceName) { name in
                     let announced = PhoneName.current(appName:name)
                     receiver.setServiceName(announced.name,source:announced.source.rawValue)
-                }.multilineTextAlignment(.trailing).accessibilityLabel("This iPhone’s device name")
+                }.multilineTextAlignment(.trailing).accessibilityLabel("This \(deviceKind)’s device name")
             }
         } header: { Text("Session") }
     }

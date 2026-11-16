@@ -27,6 +27,10 @@ enum PairedTransport {
                                                 secret as __DispatchData, label as __DispatchData)
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
-        return NWParameters(tls: tls, tcp: tcp)
+        let parameters = NWParameters(tls: tls, tcp: tcp)
+        // Match the low-latency service class already used by cable/legacy
+        // streams, without changing routing, interface choice or TLS admission.
+        parameters.serviceClass = .interactiveVideo
+        return parameters
     }
 }

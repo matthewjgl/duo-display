@@ -10,7 +10,7 @@ struct PairingApprovalPresenter: ViewModifier {
                     VStack(spacing: 18) {
                         Label("Pair with \(prompt.name)", systemImage: "lock.shield")
                             .font(.title2.bold())
-                        Text("Check that both devices show this code.")
+                        Text("Approve only if your other device shows this same code now.")
                             .multilineTextAlignment(.center)
                         Text(prompt.code).font(.system(size: 36, weight: .semibold, design: .monospaced))
                             .accessibilityLabel("Pairing code " + prompt.code.map(String.init).joined(separator: " "))

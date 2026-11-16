@@ -1,6 +1,203 @@
 import Foundation
 import CoreGraphics
 
+/// Incremental TCP framing, scoped to one already admitted connection. Reading
+/// a header and payload separately costs two network callbacks per pointer event.
+/// A chunk can contain many messages or only part of one; never assume packet boundaries.
+struct InputControlFrames {
+    enum Failure: Error { case invalidLength }
+    private var buffer = Data()
+    mutating func append(_ chunk: Data) throws -> [Data] {
+        buffer.append(chunk)
+        var offset = 0, result: [Data] = []
+        while buffer.count - offset >= 4 {
+            let length = buffer.withUnsafeBytes { Int(UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self))) }
+            guard length > 0, length < 1 << 20 else { buffer.removeAll(); throw Failure.invalidLength }
+            guard buffer.count - offset - 4 >= length else { break }
+            result.append(buffer.subdata(in: (offset+4)..<(offset+4+length)))
+            offset += 4 + length
+        }
+        if offset > 0 { buffer = Data(buffer.dropFirst(offset)) }
+        return result
+    }
+}
+
+/// One in-flight write per authenticated socket. Only adjacent, recent relative
+/// moves in the same direction may merge; clicks, scrolling and drag edges are
+/// strict barriers. No new channel, protocol, smoothing, or unauthenticated fallback.
+final class InputControlOutbox {
+    private struct Item {
+        var object: [String: Any]
+        var created: Double
+        let completion: (() -> Void)?
+    }
+    struct Metrics {
+        var enqueued = 0, writes = 0, merged = 0, staleDropped = 0, overflowDropped = 0
+        var peakPending = 0, pendingNow = 0
+        var waitP95Ms = 0.0, maxWaitMs = 0.0, maxMoveStep = 0.0
+    }
+    private var metrics = Metrics()
+    private var waitSamples: [Double] = []
+    /// Aggregate timing only: no coordinates, typed text, peer IDs or payloads.
+    /// Snapshotting never waits for a socket and adds no batching timer.
+    func metricsSnapshot(reset: Bool = false) -> Metrics {
+        lock.lock(); defer { lock.unlock() }
+        var result = metrics
+        result.pendingNow = pending.count + (writing ? 1 : 0)
+        let sorted = waitSamples.sorted()
+        if !sorted.isEmpty { result.waitP95Ms = sorted[min(sorted.count-1,Int(Double(sorted.count)*0.95))] * 1000 }
+        if reset { metrics = Metrics(); metrics.peakPending = pending.count; waitSamples.removeAll(keepingCapacity:true) }
+        return result
+    }
+    private let lock = NSLock()
+    private var pending: [Item] = []
+    private var writing = false, invalid = false
+    private let clock: () -> Double
+    private let write: (Data, @escaping (Bool) -> Void) -> Void
+    private let failure: () -> Void
+    init(clock: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime },
+         write: @escaping (Data, @escaping (Bool) -> Void) -> Void,
+         failure: @escaping () -> Void) {
+        self.clock = clock; self.write = write; self.failure = failure
+    }
+    func invalidate() { lock.lock(); invalid = true; pending.removeAll(); lock.unlock() }
+    @discardableResult
+    func enqueue(_ object: [String: Any], completion: (() -> Void)? = nil) -> Bool {
+        guard JSONSerialization.isValidJSONObject(object) else { return false }
+        lock.lock()
+        guard !invalid else { lock.unlock(); return false }
+        let now = clock()
+        metrics.enqueued += 1
+        if completion == nil, let last = pending.last, last.completion == nil,
+           now-last.created <= 0.025, let combined = Self.merging(last.object, object) {
+            pending[pending.count-1].object = combined
+            metrics.merged += 1
+        } else {
+            if pending.count >= Self.capacity { compact() }
+            guard pending.count < Self.capacity else {
+                // Only ordering-critical barriers remain: the link is genuinely stuck.
+                invalid = true; pending.removeAll(); lock.unlock(); failure(); return false
+            }
+            pending.append(Item(object: object, created: now, completion: completion))
+            metrics.peakPending = max(metrics.peakPending,pending.count)
+        }
+        lock.unlock(); pump(); return true
+    }
+    static let capacity = 128
+    /// Called with the lock held when the backlog is full. A stalled socket must
+    /// not end the session just because high-rate motion piled up: first collapse
+    /// adjacent motion regardless of age (exact displacement / latest absolute
+    /// position), then shed the oldest disposable motion or telemetry. Presses,
+    /// releases, clicks, drag edges, resets, keyboard and hello are never shed.
+    private func compact() {
+        var compacted: [Item] = []
+        for item in pending {
+            if item.completion == nil, let last = compacted.last, last.completion == nil,
+               let combined = Self.merging(last.object, item.object) ?? Self.overflowMerging(last.object, item.object) {
+                compacted[compacted.count-1].object = combined
+                metrics.merged += 1
+            } else { compacted.append(item) }
+        }
+        pending = compacted
+        while pending.count >= Self.capacity,
+              let index = pending.firstIndex(where: { $0.completion == nil && Self.isDisposable($0.object) }) {
+            pending.remove(at: index)
+            metrics.overflowDropped += 1
+        }
+    }
+    /// Motion and telemetry whose loss cannot leave a button, key or mode stuck.
+    static func isDisposable(_ object: [String: Any]) -> Bool {
+        switch object["type"] as? String {
+        case "touch": return object["phase"] as? String == "moved"
+        case "trackpad": return object["action"] as? String == "move" && object["probe"] == nil
+        case "scroll", "live", "stats", "ping": return true
+        case "pencil": return ["move", "hover"].contains(object["phase"] as? String ?? "")
+        default: return false
+        }
+    }
+    /// Merges allowed only under overflow: path fidelity is traded for staying connected.
+    private static func overflowMerging(_ first: [String: Any], _ second: [String: Any]) -> [String: Any]? {
+        guard let type = first["type"] as? String, type == second["type"] as? String else { return nil }
+        switch type {
+        case "pencil":
+            guard let a = first["phase"] as? String, a == second["phase"] as? String, a == "move" || a == "hover" else { return nil }
+            return second
+        case "live", "stats", "ping": return second
+        default: return nil
+        }
+    }
+    private static func merging(_ first: [String: Any], _ second: [String: Any]) -> [String: Any]? {
+        // Absolute touch moves: the newest position supersedes an unsent one. The
+        // Mac drags from its last posted point, so no displacement is lost.
+        if first["type"] as? String == "touch", second["type"] as? String == "touch",
+           first["phase"] as? String == "moved", second["phase"] as? String == "moved",
+           first["keyboardIntent"] == nil, second["keyboardIntent"] == nil {
+            return second
+        }
+        // Two-finger scroll deltas (both wire forms) sum exactly.
+        if let combined = scrollMerging(first, second) { return combined }
+        return trackpadMoveMerging(first, second)
+    }
+    private static func scrollMerging(_ first: [String: Any], _ second: [String: Any]) -> [String: Any]? {
+        let plain = first["type"] as? String == "scroll" && second["type"] as? String == "scroll"
+        let relative = first["type"] as? String == "trackpad" && second["type"] as? String == "trackpad"
+            && first["action"] as? String == "scroll" && second["action"] as? String == "scroll"
+        guard plain || relative,
+              let x = first["dx"] as? Double, let y = first["dy"] as? Double,
+              let dx = second["dx"] as? Double, let dy = second["dy"] as? Double,
+              x.isFinite, y.isFinite, dx.isFinite, dy.isFinite,
+              abs(x+dx) <= 2048, abs(y+dy) <= 2048 else { return nil }
+        var merged = first
+        merged["dx"] = x+dx; merged["dy"] = y+dy
+        return merged
+    }
+    private static func trackpadMoveMerging(_ first: [String: Any], _ second: [String: Any]) -> [String: Any]? {
+        guard first["type"] as? String == "trackpad", second["type"] as? String == "trackpad",
+              first["action"] as? String == "move", second["action"] as? String == "move",
+              first["probe"] == nil, second["probe"] == nil,
+              let x = first["dx"] as? Double, let y = first["dy"] as? Double,
+              let dx = second["dx"] as? Double, let dy = second["dy"] as? Double,
+              x.isFinite, y.isFinite, dx.isFinite, dy.isFinite,
+              x*dx >= 0, y*dy >= 0, abs(x+dx) <= 2048, abs(y+dy) <= 2048 else { return nil }
+        var merged = first
+        merged["dx"] = x+dx; merged["dy"] = y+dy
+        // Retain the oldest timestamp: new motion cannot rejuvenate stale input.
+        return merged
+    }
+    private func pump() {
+        lock.lock()
+        guard !writing, !invalid else { lock.unlock(); return }
+        while let first = pending.first, first.object["type"] as? String == "trackpad",
+              first.object["action"] as? String == "move", clock()-first.created > 0.25 {
+            pending.removeFirst() // Never replay a local backlog of old movement.
+            metrics.staleDropped += 1
+        }
+        guard !pending.isEmpty else { lock.unlock(); return }
+        let item = pending.removeFirst()
+        let wait = max(0,clock()-item.created)
+        waitSamples.append(wait)
+        if waitSamples.count > 128 { waitSamples.removeFirst(waitSamples.count-128) }
+        metrics.maxWaitMs = max(metrics.maxWaitMs,wait*1000)
+        metrics.writes += 1
+        if item.object["type"] as? String == "trackpad", item.object["action"] as? String == "move",
+           let dx = item.object["dx"] as? Double, let dy = item.object["dy"] as? Double,
+           dx.isFinite, dy.isFinite { metrics.maxMoveStep = max(metrics.maxMoveStep,hypot(dx,dy)) }
+        guard let payload = try? JSONSerialization.data(withJSONObject: item.object) else { lock.unlock(); return }
+        writing = true
+        lock.unlock()
+        var length = UInt32(payload.count).bigEndian
+        var frame = Data(bytes: &length, count: 4); frame.append(payload)
+        write(frame) { [self] succeeded in
+            lock.lock(); writing = false
+            let active = !invalid
+            if !succeeded { invalid = true; pending.removeAll() }
+            lock.unlock()
+            guard active else { return }
+            if succeeded { item.completion?(); pump() } else { failure() }
+        }
+    }
+}
+
 enum PhoneInputMode: String, CaseIterable {
     case touch, trackpad
     static let defaultsKey = "duo.phoneInputMode.v1"
@@ -243,24 +440,44 @@ struct TrackpadGestureAdmission {
 }
 
 /// Asynchronously posted absolute CG mouse positions may not be observable by
-/// the next input packet. Accumulate against unacknowledged targets, while an
-/// independently moved physical mouse immediately takes over. No smoothing.
+/// the next input packet. Keep a short bounded history, including targets that
+/// have already appeared in readback: coalesced/delayed observations can revisit
+/// them after a reversal. An unmatched physical-mouse position takes over at
+/// once. An indistinguishable move onto our recent path is bounded to150ms.
+/// This reconciles event ordering; it does not interpolate or smooth movement.
 struct RelativePointerLedger {
+    struct Metrics {
+        var ambiguousReadbacks = 0, unmatchedReadbacks = 0, expiredTargets = 0
+    }
+    private var metrics = Metrics()
     private var observed:CGPoint?
-    private var pending:[(point:CGPoint,time:Double)] = []
-    mutating func reset() { observed = nil; pending.removeAll() }
+    private var recentTargets:[(point:CGPoint,time:Double)] = []
+    mutating func reset() { observed = nil; recentTargets.removeAll() }
+    mutating func metricsSnapshot(reset:Bool = false) -> Metrics {
+        let result = metrics
+        if reset { metrics = Metrics() }
+        return result
+    }
     mutating func base(observation:CGPoint,now:Double) -> CGPoint {
-        pending.removeAll { now-$0.time > 0.15 }
-        if let index = pending.lastIndex(where:{ hypot($0.point.x-observation.x,$0.point.y-observation.y) < 0.5 }) {
-            pending.removeFirst(index+1)
+        let beforeExpiry = recentTargets.count
+        recentTargets.removeAll { now-$0.time > 0.15 }
+        metrics.expiredTargets += beforeExpiry-recentTargets.count
+        // Do not retire by coordinate. Neither the first nor last repeated
+        // match identifies WHICH event WindowServer observed. Retiring either
+        // can make a later self-posted observation look like external input.
+        if let index = recentTargets.firstIndex(where:{ hypot($0.point.x-observation.x,$0.point.y-observation.y) < 0.5 }) {
+            if recentTargets.dropFirst(index+1).contains(where:{ hypot($0.point.x-observation.x,$0.point.y-observation.y) < 0.5 }) {
+                metrics.ambiguousReadbacks += 1
+            }
         } else if let previous = observed, hypot(previous.x-observation.x,previous.y-observation.y) >= 0.5 {
-            pending.removeAll() // Physical mouse or other app moved the pointer.
+            if !recentTargets.isEmpty { metrics.unmatchedReadbacks += 1 }
+            recentTargets.removeAll() // Unmatched system/physical-mouse movement wins.
         }
         observed = observation
-        return pending.last?.point ?? observation
+        return recentTargets.last?.point ?? observation
     }
     mutating func posted(_ point:CGPoint,now:Double) {
-        pending.append((point,now));if pending.count > 128 { pending.removeFirst(pending.count-128) }
+        recentTargets.append((point,now));if recentTargets.count > 128 { recentTargets.removeFirst(recentTargets.count-128) }
     }
 }
 enum TrackpadPacketFreshness {

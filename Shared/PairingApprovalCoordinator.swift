@@ -18,7 +18,15 @@ final class PairingApprovalCoordinator: ObservableObject {
         let name: String
         let code: String
     }
-    enum Failure: Error { case busy, invalidPeer, expired, rejected }
+    enum Failure: LocalizedError {
+        case busy, invalidPeer, expired, rejected, alreadyTrusted
+        var errorDescription: String? {
+            switch self {
+            case .alreadyTrusted: return "This device is already paired. Use Connect, or forget its existing pairing on both devices before pairing again."
+            default: return "Pairing could not start. Cancel on both devices and try again."
+            }
+        }
+    }
     @Published private(set) var prompt: Prompt?
     @Published private(set) var status = ""
     private var key: SymmetricKey?
@@ -27,21 +35,27 @@ final class PairingApprovalCoordinator: ObservableObject {
     private var deadline = Date.distantPast
     private var timeout: Task<Void, Never>?
     private let ownID: String
+    private let alreadyTrusted: (String) throws -> Bool
     private let save: (SymmetricKey, String) throws -> Void
     var sendConfirmation: ((Data) -> Void)?
     var completed: ((String) -> Void)?
     var cancelled: (() -> Void)?
 
     init(ownID: String = PairingApprovalCoordinator.localID,
+         alreadyTrusted: @escaping (String) throws -> Bool = { try SecurePairingKeyStore.load(peerID: $0) != nil },
          save: @escaping (SymmetricKey, String) throws -> Void = { try SecurePairingKeyStore.save($0, peerID: $1) }) {
         self.ownID = ownID
         self.save = save
+        self.alreadyTrusted = alreadyTrusted
     }
 
     func begin(peerID: String, name: String, material: SecurePairing.Material,
                now: Date = Date(), lifetime: TimeInterval = 60) throws {
         guard prompt == nil else { throw Failure.busy }
         guard !peerID.isEmpty, peerID != ownID, peerID.utf8.count <= 256 else { throw Failure.invalidPeer }
+        // Self-asserted discovery IDs cannot silently replace a trusted key.
+        // Re-pair requires an explicit Forget operation first.
+        guard try !alreadyTrusted(peerID) else { throw Failure.alreadyTrusted }
         key = material.key
         localApproved = false; remoteApproved = false
         deadline = now.addingTimeInterval(max(0, min(lifetime, 120)))

@@ -6,7 +6,17 @@ import CryptoKit
 /// A matching code must be explicitly approved on both app interfaces.
 @MainActor
 final class PairingExchange {
-    enum ExchangeError: Error { case invalidMessage, disconnected, timeout }
+    enum ExchangeError: LocalizedError {
+        case invalidMessage, disconnected, timeout, unsupportedVersion
+        var errorDescription: String? {
+            switch self {
+            case .unsupportedVersion: return "Update SideExtend on both devices to pair securely. Existing trusted devices can still reconnect."
+            case .timeout: return "Pairing timed out. Keep both apps open and try again."
+            case .invalidMessage: return "Pairing verification failed. Cancel on both devices and try again on a trusted network."
+            case .disconnected: return "Pairing interrupted or declined. Try Pair & Connect again."
+            }
+        }
+    }
     private let connection: NWConnection
     private let coordinator: PairingApprovalCoordinator
     private let privateKey = P256.KeyAgreement.PrivateKey()
@@ -16,7 +26,15 @@ final class PairingExchange {
     private let name: String
     private var active = true
     private var began = false
+    private var started = false
+    private var peerCommitment: Data?
+    private var revealed = false
+    private var ownOpening: PairingV2.Opening {
+        .init(id: ownID, name: name, initiator: initiator,
+              publicKey: privateKey.publicKey.rawRepresentation, nonce: nonce)
+    }
     private var expiry: Task<Void, Never>?
+    private var precommitDeadline: Task<Void, Never>?
     private var material: SecurePairing.Material?
     private var peerID: String?
     var onPrompt: (() -> Void)?
@@ -26,20 +44,25 @@ final class PairingExchange {
     init(connection: NWConnection, coordinator: PairingApprovalCoordinator,
          ownID: String, name: String, initiator: Bool) {
         self.connection = connection; self.coordinator = coordinator
-        self.ownID = ownID; self.name = String(name.prefix(128)); self.initiator = initiator
+        self.ownID = ownID; self.name = PairingV2.displayName(name); self.initiator = initiator
     }
 
     func start(timeout: TimeInterval = 60) {
+        guard !started else { return }
+        started = true
         connection.stateUpdateHandler = { [weak self] state in
             Task { @MainActor in
                 guard let self, self.active else { return }
                 switch state {
                 case .ready:
-                    self.send(["type": "pairHello", "id": self.ownID, "name": self.name,
-                               "initiator": self.initiator,
-                               "publicKey": self.privateKey.publicKey.rawRepresentation.base64EncodedString(),
-                               "nonce": self.nonce.base64EncodedString()])
-                    self.receiveHeader()
+                    do {
+                        // Never send a reveal (or accept v1 hello) before the
+                        // peer's fixed commitment. No downgrade negotiation.
+                        let commitment = try self.ownOpening.commitment()
+                        self.send(["type": "pairCommit", "version": PairingV2.version,
+                                   "commitment": commitment.base64EncodedString()])
+                        self.receiveHeader()
+                    } catch { self.fail(ExchangeError.invalidMessage) }
                 case .failed(let error): self.fail(error)
                 case .cancelled: self.fail(ExchangeError.disconnected)
                 default: break
@@ -50,6 +73,11 @@ final class PairingExchange {
             try? await Task.sleep(nanoseconds: UInt64(max(0.1, min(timeout, 120)) * 1_000_000_000))
             guard !Task.isCancelled else { return }
             self?.fail(ExchangeError.timeout)
+        }
+        precommitDeadline = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled, let self, self.peerCommitment == nil else { return }
+            self.fail(ExchangeError.timeout)
         }
         connection.start(queue: .main)
     }
@@ -95,25 +123,37 @@ final class PairingExchange {
     }
 
     private func handle(_ object: [String: Any]) throws {
+        guard object["version"] as? Int == PairingV2.version else { throw ExchangeError.unsupportedVersion }
         switch object["type"] as? String {
-        case "pairHello":
-            guard !began, let id = object["id"] as? String,
+        case "pairCommit":
+            guard peerCommitment == nil, !revealed, !began,
+                  let encoded = object["commitment"] as? String,
+                  let commitment = Data(base64Encoded: encoded), commitment.count == 32
+            else { throw ExchangeError.invalidMessage }
+            precommitDeadline?.cancel()
+            peerCommitment = commitment
+            let opening = ownOpening
+            revealed = true
+            send(["type": "pairReveal", "version": PairingV2.version,
+                  "id": opening.id, "name": opening.name, "initiator": opening.initiator,
+                  "publicKey": opening.publicKey.base64EncodedString(), "nonce": opening.nonce.base64EncodedString()])
+        case "pairReveal":
+            guard !began, revealed, let commitment = peerCommitment,
+                  let id = object["id"] as? String,
                   let role = object["initiator"] as? Bool, role != initiator,
                   let publicString = object["publicKey"] as? String, let bytes = Data(base64Encoded: publicString),
                   let nonceString = object["nonce"] as? String, let peerNonce = Data(base64Encoded: nonceString),
                   let peerName = object["name"] as? String else { throw ExchangeError.invalidMessage }
-            let peer = try P256.KeyAgreement.PublicKey(rawRepresentation: bytes)
-            let derived = try SecurePairing.derive(privateKey: privateKey, peerPublicKey: peer,
-                initiator: initiator ? privateKey.publicKey : peer,
-                responder: initiator ? peer : privateKey.publicKey,
-                initiatorNonce: initiator ? nonce : peerNonce, responderNonce: initiator ? peerNonce : nonce)
+            let opening = PairingV2.Opening(id: id, name: peerName, initiator: role, publicKey: bytes, nonce: peerNonce)
+            do { try opening.verify(commitment) } catch { throw ExchangeError.invalidMessage }
+            let derived = try PairingV2.derive(privateKey: privateKey, own: ownOpening, peer: opening)
             try coordinator.begin(peerID: id, name: peerName, material: derived)
             material = derived; peerID = id; began = true
-            coordinator.sendConfirmation = { [weak self] proof in self?.send(["type": "pairApproval", "proof": proof.base64EncodedString()]) }
+            coordinator.sendConfirmation = { [weak self] proof in self?.send(["type": "pairApproval", "version": PairingV2.version, "proof": proof.base64EncodedString()]) }
             coordinator.cancelled = { [weak self] in self?.fail(ExchangeError.disconnected) }
             coordinator.completed = { [weak self] peer in
                 guard let self, self.active, let material = self.material else { return }
-                self.active = false; self.expiry?.cancel()
+                self.active = false; self.expiry?.cancel(); self.precommitDeadline?.cancel()
                 // Finish the queued confirmation before the owner tears down the socket.
                 self.connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] error in
                     Task { @MainActor in
@@ -134,8 +174,8 @@ final class PairingExchange {
 
     private func fail(_ error: Error) {
         guard active else { return }
-        active = false; expiry?.cancel(); connection.cancel()
-        if began { coordinator.cancel(message: "Pairing interrupted. Try again.") }
+        active = false; expiry?.cancel(); precommitDeadline?.cancel(); connection.cancel()
+        if began { coordinator.cancel(message: error.localizedDescription) }
         onFailure?(error)
     }
 }

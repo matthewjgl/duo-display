@@ -36,6 +36,8 @@ struct TrackpadGestureSettings:View {
                 if !receiver.macSupportsShortcutGestures { Text("Connect to the matching updated Mac app to use shortcut gestures.").font(.footnote) }
                 if receiver.gestureProfileID == nil { Text("Pair and connect over Wi-Fi to review shortcuts for this specific Mac. USB pointer, clicks and scrolling remain available.").font(.footnote) }
             }
+            // Edits save per paired Mac; without one they would be discarded.
+            Group {
             ForEach([3,4],id:\.self) { count in
                 Section("\(count)-finger swipes") {
                     ForEach(TrackpadSwipeDirection.allCases,id:\.self) { direction in
@@ -51,6 +53,7 @@ struct TrackpadGestureSettings:View {
                 }
                 Text("Four-finger left/right and up are suggested; three-finger actions and App Exposé start off. Change finger counts and directions above. A disabled or conflicting global shortcut cannot be overridden here.").font(.footnote).foregroundStyle(.secondary)
             }
+            }.disabled(receiver.gestureProfileID == nil)
             Section("Limitations") {
                 Text("Use deliberate swipes away from screen edges. Lift all fingers before the next gesture. iOS may reserve three-finger editing gestures or edge swipes and cancel delivery; SideExtend does not bypass them. Pinch, spread, force-click and continuous Space animations are not synthesized.")
                     .font(.footnote)

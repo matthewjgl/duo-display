@@ -41,4 +41,31 @@ final class CaptureSourceCheckTests: XCTestCase {
         XCTAssertFalse(check.frame(screenRect: .zero, expected: iMac, now: t0))
         XCTAssertFalse(check.frame(screenRect: .zero, expected: iMac, now: t0 + 5))
     }
+    func testLoggedScaledNegativeOriginRoundoffNeverRestartsLiveCapture() {
+        let expected = CGRect(x:514,y:-938,width:1334,height:938)
+        let actual = CGRect(x:514,y:-938,width:1334,height:937.9999999999999)
+        var check = CaptureSourceCheck()
+        var falseRestarts = 0
+        for frame in 0..<900 {
+            if check.frame(screenRect:actual,expected:expected,now:t0+Double(frame)/60) { falseRestarts += 1 }
+        }
+        XCTAssertEqual(falseRestarts,0, "Build17 repeatedly stopped capture for equivalent scaled bounds")
+    }
+
+    func testPrecisionTolerancePreservesRealMismatchAndClearsTransientHistory() {
+        let original = CGRect(x:-1334,y:514,width:938,height:1334)
+        let rounded = CGRect(x:-1334+1e-10,y:514,width:938,height:1334-1e-10)
+        let wrong = original.offsetBy(dx:1,dy:0)
+        var check = CaptureSourceCheck()
+        XCTAssertFalse(check.frame(screenRect:wrong,expected:original,now:t0))
+        XCTAssertFalse(check.frame(screenRect:rounded,expected:original,now:t0+1))
+        XCTAssertFalse(check.frame(screenRect:wrong,expected:original,now:t0+2))
+        XCTAssertFalse(check.frame(screenRect:wrong,expected:original,now:t0+3))
+        XCTAssertTrue(check.frame(screenRect:wrong,expected:original,now:t0+4))
+        for dimension in [0,1,2,3] {
+            var values:[CGFloat] = [-1334,514,938,1334];values[dimension] += 0.01
+            XCTAssertFalse(CaptureSourceCheck.sameDisplayRect(original,CGRect(x:values[0],y:values[1],width:values[2],height:values[3])))
+        }
+    }
+
 }

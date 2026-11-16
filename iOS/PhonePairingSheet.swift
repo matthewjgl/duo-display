@@ -8,7 +8,7 @@ struct PhonePairingSheet:View {
         AdaptiveNavigation {
             Group {
                 if let prompt = pairing.prompt {
-                    PhonePairingContent(name:prompt.name,code:prompt.code,approved:pairing.localApproved,
+                    PhonePairingContent(name:prompt.name,code:prompt.code,approved:pairing.localApproved,deviceKind:deviceKind,
                         approve:{pairing.approve()},cancel:{pairing.cancel()})
                 } else { ProgressView("Finishing pairing…") }
             }.navigationTitle("Pair your Mac").navigationBarTitleDisplayMode(.inline)

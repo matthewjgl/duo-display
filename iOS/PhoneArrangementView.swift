@@ -15,13 +15,13 @@ struct PhoneArrangementView: View {
             VStack(alignment:.leading,spacing:20) {
                 if let report {
                     Text(placement == nil ? "Current layout" : "Preview — not applied").font(.headline)
-                    ArrangementLayoutPreview(topology:proposed ?? report.topology,target:report.target)
+                    ArrangementLayoutPreview(topology:proposed ?? report.topology,target:report.target,deviceKind:deviceKind)
                         .frame(height:240)
-                    Text("Blue identifies this iPhone. The top bar marks the main display.").font(.caption).foregroundStyle(.secondary)
+                    Text("Blue identifies this \(deviceKind). The top bar marks the main display.").font(.caption).foregroundStyle(.secondary)
                     if let reason = report.unavailable {
                         Label(reason,systemImage:"info.circle").font(.subheadline).foregroundStyle(.secondary)
                     } else {
-                        Text("Place this iPhone beside your Mac’s main display.").font(.subheadline).foregroundStyle(.secondary)
+                        Text("Place this \(deviceKind) beside your Mac’s main display.").font(.subheadline).foregroundStyle(.secondary)
                         LazyVGrid(columns:[GridItem(.flexible()),GridItem(.flexible())],spacing:12) {
                             ForEach(PhoneDisplayPlacement.allCases,id: \.self) { side in
                                 let available = report.target.flatMap { PhoneArrangementGeometry.origin(side,topology:report.topology,target:$0) } != nil
@@ -64,7 +64,7 @@ struct PhoneArrangementView: View {
                     ProgressView("Reading Mac display layout…").frame(maxWidth:.infinity)
                 }
                 if let error = receiver.arrangementError { Label(error,systemImage:"exclamationmark.circle").font(.footnote).foregroundStyle(.orange) }
-                if !receiver.connected { Text("Reconnect to arrange your iPhone’s extended display.").font(.footnote) }
+                if !receiver.connected { Text("Reconnect to arrange your \(deviceKind)’s extended display.").font(.footnote) }
                 Button("Refresh layout") { placement = nil; previewRevision = nil; receiver.watchPhoneArrangement(true) }
                     .disabled(!receiver.connected || !receiver.macSupportsArrangement || receiver.arrangementPending || report?.busy == true)
                 Text("Other displays and the primary display stay in place. macOS may briefly fade the screens while applying. Undo expires if the display topology changes.")

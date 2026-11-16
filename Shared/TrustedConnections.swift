@@ -109,9 +109,9 @@ final class TrustedConnections: ObservableObject {
             }
         })
         let monitor = NWPathMonitor(); pathMonitor = monitor
-        var first = true
-        monitor.pathUpdateHandler = { [weak self] _ in
-            if first { first = false; return }
+        let filter = PathChangeFilter()
+        monitor.pathUpdateHandler = { [weak self] update in
+            guard filter.changed(update) else { return }
             Task { @MainActor in self?.scheduleRecovery() }
         }
         monitor.start(queue: DispatchQueue(label: "DuoDisplay.trusted-network"))
